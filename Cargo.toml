@@ -1,0 +1,23 @@
+[package]
+name = "s3-cas"
+version = "0.1.0"
+edition = "2018"
+authors = ["Lee Smet <lee.smet@hotmail.com>"]
+readme = "README.md"
+description = "An experimental S3 server using a cas storage layer"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "s3-cas"
+required-features = ["tokio"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"], optional = true }
+s3-server = "0.1"
+sled = "0.34"
+async-trait = "0.1"
+md-5 = "0.9"
+hyper = { version = "0.14.7", features = ["server"] }
+pin-project-lite = "0.2"
+futures = "0.3"
