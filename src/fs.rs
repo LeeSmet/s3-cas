@@ -1,16 +1,32 @@
 use crate::bytes::BytesStream;
 use async_trait::async_trait;
-use s3_server::errors::S3StorageError;
+use faster_hex::hex_string;
+use futures::{
+    channel::mpsc::unbounded,
+    sink::SinkExt,
+    stream,
+    stream::{StreamExt, TryStreamExt},
+    AsyncRead,
+};
+use md5::{Digest, Md5};
 use s3_server::S3Storage;
-use sled::{Db, IVec};
+use s3_server::{dto::UploadPartRequest, errors::S3StorageError};
+use serde::{Deserialize, Serialize};
+use sled::{Db, IVec, Transactional};
+use std::mem;
 use std::{
     convert::{TryFrom, TryInto},
     fmt::{self, Display, Formatter},
+    io,
     path::PathBuf,
 };
 
+const BLOCK_SIZE: usize = 1 << 20;
 const BLOCK_TREE: &str = "_BLOCKS";
+const PATH_TREE: &str = "_PATHS";
+const MULTIPART_TREE: &str = "_MULTIPART_PARTS";
 const BLOCKID_SIZE: usize = 16;
+const PTR_SIZE: usize = mem::size_of::<usize>(); // Size of a `usize` in bytes
 
 type BlockID = [u8; BLOCKID_SIZE]; // Size of an md5 hash
 
@@ -25,6 +41,16 @@ impl CasFS {
         self.db.open_tree(BLOCK_TREE)
     }
 
+    /// Open the tree containing the path map.
+    fn path_tree(&self) -> Result<sled::Tree, sled::Error> {
+        self.db.open_tree(PATH_TREE)
+    }
+
+    /// Open the tree containing the multipart parts.
+    fn multipart_tree(&self) -> Result<sled::Tree, sled::Error> {
+        self.db.open_tree(MULTIPART_TREE)
+    }
+
     /// Check if a bucket with a given name exists.
     fn bucket_exists(&self, bucket_name: &str) -> bool {
         let bn_iv = IVec::from(bucket_name);
@@ -34,6 +60,139 @@ impl CasFS {
     /// Open the tree containing the objects in a bucket.
     fn bucket(&self, bucket_name: &str) -> Result<sled::Tree, sled::Error> {
         self.db.open_tree(bucket_name)
+    }
+
+    /// Save data on the filesystem. A list of block ID's used as keys for the data blocks is
+    /// returned, along with the hash of the full byte stream.
+    async fn store_bytes<R: AsyncRead + Unpin>(
+        &self,
+        data: BytesStream<R>,
+    ) -> io::Result<(Vec<BlockID>, BlockID)> {
+        let block_map = self.block_tree()?;
+        let path_map = self.path_tree()?;
+        let (tx, rx) = unbounded();
+        let mut content_hash = Md5::new();
+        data.inspect(|bytes| {
+            content_hash.update(match bytes {
+                Ok(d) => d.as_ref(),
+                Err(_) => &[],
+            })
+        })
+        .chunks(BLOCK_SIZE)
+        .zip(stream::repeat((tx, block_map, path_map)))
+        .for_each_concurrent(
+            5,
+            |(byte_chunk, (mut tx, block_map, path_map))| async move {
+                for res in &byte_chunk {
+                    if let Err(e) = res {
+                        if let Err(e) = tx
+                            .send(Err(std::io::Error::new(e.kind(), e.to_string())))
+                            .await
+                        {
+                            eprintln!("Could not convey result: {}", e);
+                        }
+                        return;
+                    }
+                }
+                // unwrap is safe as we checked that there is no error above
+                let bytes: Vec<u8> = byte_chunk.into_iter().flat_map(|r| r.unwrap()).collect();
+                let mut hasher = Md5::new();
+                hasher.update(&bytes);
+                let block_hash: BlockID = hasher.finalize().into();
+                let data_len = bytes.len();
+
+                // Check if the hash is present in the block map. If it is not, try to find a path, and
+                // insert it.
+                let should_write: Result<bool, sled::transaction::TransactionError> =
+                    (&block_map, &path_map).transaction(|(blocks, paths)| {
+                        let bid = blocks.get(block_hash)?;
+                        if bid.is_some() {
+                            // block already exists, since we did not write we can return here
+                            // without error
+                            return Ok(false);
+                        }
+
+                        // find a free path
+                        for index in 0..BLOCKID_SIZE {
+                            if paths.get(&block_hash[..index])?.is_some() {
+                                // path already used, try the next one
+                                continue;
+                            };
+
+                            // path is free, insert
+                            paths.insert(&block_hash[..index], &block_hash)?;
+
+                            let block = Block {
+                                size: data_len,
+                                path: block_hash[..index].to_vec(),
+                            };
+
+                            // unwrap here is fine since that would be a coding error
+                            let block_meta = serde_json::to_vec(&block).unwrap();
+                            blocks.insert(&block_hash, block_meta)?;
+                            return Ok(true);
+                        }
+
+                        // The loop above can only NOT find a path in case it is duplicate
+                        // block, wich already breaks out at the start.
+                        unreachable!();
+                    });
+
+                match should_write {
+                    Err(sled::transaction::TransactionError::Storage(e)) => {
+                        if let Err(e) = tx.send(Err(e.into())).await {
+                            eprintln!("Could not send transaction error: {}", e);
+                        }
+                        return;
+                    }
+                    Ok(false) => {
+                        if let Err(e) = tx.send(Ok(block_hash)).await {
+                            eprintln!("Could not send block id: {}", e);
+                        }
+                        return;
+                    }
+                    Ok(true) => {}
+                    _ => unreachable!(),
+                };
+
+                // write the actual block
+                // first load the block again from the DB
+                let block: Block = match block_map.get(block_hash) {
+                    // unwrap here is fine as that would be a coding error
+                    Ok(Some(encoded_block)) => serde_json::from_slice(&encoded_block).unwrap(),
+                    // we just inserted this block, so this is by definition impossible
+                    Ok(None) => unreachable!(),
+                    Err(e) => {
+                        if let Err(e) = tx.send(Err(e.into())).await {
+                            eprintln!("Could not send db error: {}", e);
+                        }
+                        return;
+                    }
+                };
+
+                let block_path = block.disk_path(self.root.clone());
+                if let Err(e) = async_fs::create_dir_all(block_path.parent().unwrap()).await {
+                    if let Err(e) = tx.send(Err(e)).await {
+                        eprintln!("Could not send path create error: {}", e);
+                    }
+                }
+                if let Err(e) = async_fs::write(block_path, bytes).await {
+                    if let Err(e) = tx.send(Err(e)).await {
+                        eprintln!("Could not send block write error: {}", e);
+                    }
+                }
+
+                if let Err(e) = tx.send(Ok(block_hash)).await {
+                    eprintln!("Could not send block id: {}", e);
+                }
+            },
+        )
+        .await;
+
+        Ok((
+            rx.try_collect::<Vec<BlockID>>().await?,
+            content_hash.finalize().into(),
+        ))
     }
 }
 
@@ -71,23 +230,28 @@ impl From<sled::Error> for FsError {
     }
 }
 
+#[derive(Debug)]
 struct Object {
     size: u64,
     atime: u64,
     ctime: u64,
     mtime: u64,
-    key: String,
+    md5: BlockID,
+    key: String, // TODO: is this even needed?
     blocks: Vec<BlockID>,
 }
 
 impl From<Object> for Vec<u8> {
     fn from(o: Object) -> Self {
-        let mut data = Vec::with_capacity(32 + 8 + o.key.len() + 8 + o.blocks.len() * BLOCKID_SIZE);
+        let mut data = Vec::with_capacity(
+            32 + BLOCKID_SIZE + 8 + o.key.len() + 8 + o.blocks.len() * BLOCKID_SIZE,
+        );
 
         data.extend_from_slice(&o.size.to_le_bytes());
         data.extend_from_slice(&o.atime.to_le_bytes());
         data.extend_from_slice(&o.ctime.to_le_bytes());
         data.extend_from_slice(&o.mtime.to_le_bytes());
+        data.extend_from_slice(&o.md5);
         data.extend_from_slice(&o.key.len().to_le_bytes());
         data.extend_from_slice(o.key.as_bytes());
         data.extend_from_slice(&o.blocks.len().to_le_bytes());
@@ -103,29 +267,43 @@ impl TryFrom<&[u8]> for Object {
     type Error = FsError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() < 40 {
+        if value.len() < 32 + BLOCKID_SIZE + PTR_SIZE {
             return Err(FsError::MalformedObject);
         }
         // unwrap is safe since we checked the lenght of the object
-        let key_len = usize::from_le_bytes(value[32..40].try_into().unwrap());
+        let key_len = usize::from_le_bytes(
+            value[32 + BLOCKID_SIZE..32 + BLOCKID_SIZE + PTR_SIZE]
+                .try_into()
+                .unwrap(),
+        );
         // already check the block length is included here
-        if value.len() < 40 + key_len + 8 {
+        if value.len() < 32 + BLOCKID_SIZE + PTR_SIZE + key_len + PTR_SIZE {
             return Err(FsError::MalformedObject);
         }
         // SAFETY: This is safe as we only fill in valid strings when storing, and we checked the
         // length of the data
-        let key = unsafe { String::from_utf8_unchecked(value[40..40 + key_len].to_vec()) };
+        let key = unsafe {
+            String::from_utf8_unchecked(
+                value[32 + PTR_SIZE + BLOCKID_SIZE..32 + PTR_SIZE + BLOCKID_SIZE + key_len]
+                    .to_vec(),
+            )
+        };
 
-        let block_len =
-            usize::from_le_bytes(value[40 + key_len..40 + key_len + 8].try_into().unwrap());
+        let block_len = usize::from_le_bytes(
+            value[32 + PTR_SIZE + BLOCKID_SIZE + key_len
+                ..32 + PTR_SIZE + BLOCKID_SIZE + key_len + PTR_SIZE]
+                .try_into()
+                .unwrap(),
+        );
 
-        if value.len() != 48 + key_len + block_len * BLOCKID_SIZE {
+        if value.len() != 32 + 2 * PTR_SIZE + BLOCKID_SIZE + key_len + block_len * BLOCKID_SIZE {
             return Err(FsError::MalformedObject);
         }
 
         let mut blocks = Vec::with_capacity(block_len);
 
-        for chunk in value[48 + key_len..].chunks_exact(BLOCKID_SIZE) {
+        for chunk in value[32 + 2 * PTR_SIZE + BLOCKID_SIZE + key_len..].chunks_exact(BLOCKID_SIZE)
+        {
             blocks.push(chunk.try_into().unwrap());
         }
 
@@ -134,9 +312,31 @@ impl TryFrom<&[u8]> for Object {
             atime: u64::from_le_bytes(value[8..16].try_into().unwrap()),
             ctime: u64::from_le_bytes(value[16..24].try_into().unwrap()),
             mtime: u64::from_le_bytes(value[24..32].try_into().unwrap()),
+            md5: value[32..32 + BLOCKID_SIZE].try_into().unwrap(),
             key,
             blocks,
         })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Block {
+    size: usize,
+    path: Vec<u8>,
+}
+
+impl Block {
+    fn disk_path(&self, mut root: PathBuf) -> PathBuf {
+        // path has at least len 1
+        let dirs = &self.path[..self.path.len() - 1];
+        for byte in dirs {
+            root.push(hex_string(&[*byte]));
+        }
+        root.push(format!(
+            "_{}",
+            hex_string(&[self.path[self.path.len() - 1]])
+        ));
+        root
     }
 }
 
@@ -299,6 +499,20 @@ impl S3Storage for CasFS {
         s3_server::dto::UploadPartOutput,
         s3_server::dto::UploadPartError,
     > {
+        let UploadPartRequest {
+            body,
+            bucket,
+            content_length,
+            content_md5,
+            key,
+            part_number,
+            upload_id,
+            ..
+        } = input;
+
+        let body = body.ok_or_else(|| {
+            code_error!(IncompleteBody, "You did not provide the number of bytes specified by the Content-Length HTTP header.")
+        })?;
         todo!()
     }
 }
