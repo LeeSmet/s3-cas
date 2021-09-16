@@ -1,5 +1,5 @@
-use crate::bytes::BytesStream;
 use async_trait::async_trait;
+use chrono::prelude::*;
 use faster_hex::hex_string;
 use futures::{
     channel::mpsc::unbounded,
@@ -9,19 +9,35 @@ use futures::{
     AsyncRead,
 };
 use md5::{Digest, Md5};
-use s3_server::S3Storage;
-use s3_server::{dto::UploadPartRequest, errors::S3StorageError};
+use s3_server::{
+    dto::{
+        Bucket, ByteStream, CompleteMultipartUploadError, CompleteMultipartUploadOutput,
+        CompleteMultipartUploadRequest, CreateBucketOutput, CreateBucketRequest,
+        CreateMultipartUploadOutput, CreateMultipartUploadRequest, GetBucketLocationOutput,
+        GetBucketLocationRequest, HeadBucketOutput, HeadBucketRequest, ListBucketsOutput,
+        ListBucketsRequest, ListObjectsOutput, ListObjectsRequest, ListObjectsV2Output,
+        ListObjectsV2Request, Object as S3Object,
+    },
+    errors::S3StorageResult,
+    path::S3Path,
+    S3Storage,
+};
+use s3_server::{
+    dto::{UploadPartOutput, UploadPartRequest},
+    errors::S3StorageError,
+};
 use serde::{Deserialize, Serialize};
 use sled::{Db, IVec, Transactional};
-use std::mem;
 use std::{
     convert::{TryFrom, TryInto},
     fmt::{self, Display, Formatter},
-    io,
+    io, mem,
     path::PathBuf,
 };
+use uuid::Uuid;
 
-const BLOCK_SIZE: usize = 1 << 20;
+const BLOCK_SIZE: usize = 1 << 20; // Supposedly 1 MiB
+const BUCKET_META_TREE: &str = "_BUCKETS";
 const BLOCK_TREE: &str = "_BLOCKS";
 const PATH_TREE: &str = "_PATHS";
 const MULTIPART_TREE: &str = "_MULTIPART_PARTS";
@@ -36,6 +52,16 @@ pub struct CasFS {
 }
 
 impl CasFS {
+    pub fn new(mut root: PathBuf) -> Self {
+        let mut db_path = root.clone();
+        db_path.push("db");
+        root.push("blocks");
+        Self {
+            db: sled::open(db_path).unwrap(),
+            root,
+        }
+    }
+
     /// Open the tree containing the block map.
     fn block_tree(&self) -> Result<sled::Tree, sled::Error> {
         self.db.open_tree(BLOCK_TREE)
@@ -52,9 +78,8 @@ impl CasFS {
     }
 
     /// Check if a bucket with a given name exists.
-    fn bucket_exists(&self, bucket_name: &str) -> bool {
-        let bn_iv = IVec::from(bucket_name);
-        self.db.tree_names().contains(&bn_iv)
+    fn bucket_exists(&self, bucket_name: &str) -> Result<bool, sled::Error> {
+        self.bucket_meta_tree()?.contains_key(bucket_name)
     }
 
     /// Open the tree containing the objects in a bucket.
@@ -62,12 +87,35 @@ impl CasFS {
         self.db.open_tree(bucket_name)
     }
 
+    /// Open the tree containing the bucket metadata
+    fn bucket_meta_tree(&self) -> Result<sled::Tree, sled::Error> {
+        self.db.open_tree(BUCKET_META_TREE)
+    }
+
+    /// Get a list of all buckets in the system.
+    fn buckets(&self) -> Result<Vec<Bucket>, sled::Error> {
+        Ok(self
+            .bucket_meta_tree()?
+            .scan_prefix(&[])
+            .values()
+            .filter_map(|raw_value| {
+                let value = match raw_value {
+                    Err(_) => return None,
+                    Ok(v) => v,
+                };
+                // unwrap here is fine as it means the db is corrupt
+                let bucket_meta = serde_json::from_slice::<BucketMeta>(&value).unwrap();
+                Some(Bucket {
+                    name: Some(bucket_meta.name),
+                    creation_date: Some(Utc.timestamp(bucket_meta.ctime, 0).to_rfc3339()),
+                })
+            })
+            .collect())
+    }
+
     /// Save data on the filesystem. A list of block ID's used as keys for the data blocks is
     /// returned, along with the hash of the full byte stream.
-    async fn store_bytes<R: AsyncRead + Unpin>(
-        &self,
-        data: BytesStream<R>,
-    ) -> io::Result<(Vec<BlockID>, BlockID)> {
+    async fn store_bytes(&self, data: ByteStream) -> io::Result<(Vec<BlockID>, BlockID)> {
         let block_map = self.block_tree()?;
         let path_map = self.path_tree()?;
         let (tx, rx) = unbounded();
@@ -78,6 +126,7 @@ impl CasFS {
                 Err(_) => &[],
             })
         })
+        // TODO: fix this to pull bytes, not results, and to write as soon as possible
         .chunks(BLOCK_SIZE)
         .zip(stream::repeat((tx, block_map, path_map)))
         .for_each_concurrent(
@@ -113,7 +162,8 @@ impl CasFS {
                         }
 
                         // find a free path
-                        for index in 0..BLOCKID_SIZE {
+                        for index in 1..BLOCKID_SIZE {
+                            println!("Checking path {}", hex_string(&block_hash[..index]));
                             if paths.get(&block_hash[..index])?.is_some() {
                                 // path already used, try the next one
                                 continue;
@@ -152,7 +202,8 @@ impl CasFS {
                         return;
                     }
                     Ok(true) => {}
-                    _ => unreachable!(),
+                    // We don't abort manually so this can't happen
+                    Err(sled::transaction::TransactionError::Abort(_)) => unreachable!(),
                 };
 
                 // write the actual block
@@ -233,10 +284,10 @@ impl From<sled::Error> for FsError {
 #[derive(Debug)]
 struct Object {
     size: u64,
-    atime: u64,
-    ctime: u64,
-    mtime: u64,
-    md5: BlockID,
+    atime: i64,
+    ctime: i64,
+    mtime: i64,
+    e_tag: BlockID,
     key: String, // TODO: is this even needed?
     blocks: Vec<BlockID>,
 }
@@ -251,7 +302,7 @@ impl From<Object> for Vec<u8> {
         data.extend_from_slice(&o.atime.to_le_bytes());
         data.extend_from_slice(&o.ctime.to_le_bytes());
         data.extend_from_slice(&o.mtime.to_le_bytes());
-        data.extend_from_slice(&o.md5);
+        data.extend_from_slice(&o.e_tag);
         data.extend_from_slice(&o.key.len().to_le_bytes());
         data.extend_from_slice(o.key.as_bytes());
         data.extend_from_slice(&o.blocks.len().to_le_bytes());
@@ -309,10 +360,10 @@ impl TryFrom<&[u8]> for Object {
 
         Ok(Object {
             size: u64::from_le_bytes(value[0..8].try_into().unwrap()),
-            atime: u64::from_le_bytes(value[8..16].try_into().unwrap()),
-            ctime: u64::from_le_bytes(value[16..24].try_into().unwrap()),
-            mtime: u64::from_le_bytes(value[24..32].try_into().unwrap()),
-            md5: value[32..32 + BLOCKID_SIZE].try_into().unwrap(),
+            atime: i64::from_le_bytes(value[8..16].try_into().unwrap()),
+            ctime: i64::from_le_bytes(value[16..24].try_into().unwrap()),
+            mtime: i64::from_le_bytes(value[24..32].try_into().unwrap()),
+            e_tag: value[32..32 + BLOCKID_SIZE].try_into().unwrap(),
             key,
             blocks,
         })
@@ -323,6 +374,23 @@ impl TryFrom<&[u8]> for Object {
 struct Block {
     size: usize,
     path: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MultiPart {
+    size: usize,
+    part_number: i64,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    hash: BlockID,
+    blocks: Vec<BlockID>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BucketMeta {
+    name: String,
+    ctime: i64,
 }
 
 impl Block {
@@ -344,12 +412,98 @@ impl Block {
 impl S3Storage for CasFS {
     async fn complete_multipart_upload(
         &self,
-        input: s3_server::dto::CompleteMultipartUploadRequest,
-    ) -> s3_server::errors::S3StorageResult<
-        s3_server::dto::CompleteMultipartUploadOutput,
-        s3_server::dto::CompleteMultipartUploadError,
-    > {
-        todo!()
+        input: CompleteMultipartUploadRequest,
+    ) -> S3StorageResult<CompleteMultipartUploadOutput, s3_server::dto::CompleteMultipartUploadError>
+    {
+        let CompleteMultipartUploadRequest {
+            multipart_upload,
+            bucket,
+            key,
+            upload_id,
+            ..
+        } = input;
+
+        let multipart_upload = if let Some(multipart_upload) = multipart_upload {
+            multipart_upload
+        } else {
+            let err = code_error!(InvalidPart, "Missing multipart_upload");
+            return Err(err.into());
+        };
+
+        let multipart_map = trace_try!(self.multipart_tree());
+
+        let mut blocks = vec![];
+        let mut cnt: i64 = 0;
+        for part in multipart_upload.parts.iter().flatten() {
+            let part_number = trace_try!(part
+                .part_number
+                .ok_or_else(|| { io::Error::new(io::ErrorKind::NotFound, "Missing part_number") }));
+            cnt = cnt.wrapping_add(1);
+            if part_number != cnt {
+                trace_try!(Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "InvalidPartOrder"
+                )));
+            }
+            let part_key = format!("{}-{}-{}-{}", &bucket, &key, &upload_id, part_number);
+            let part_data_enc = trace_try!(multipart_map.get(part_key));
+            let part_data_enc = trace_try!(part_data_enc
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Part not uploaded")));
+
+            // unwrap here is safe as it is a coding error
+            let mp: MultiPart = serde_json::from_slice(&part_data_enc).unwrap();
+
+            blocks.extend_from_slice(&mp.blocks);
+        }
+
+        let mut hasher = Md5::new();
+        let mut size = 0;
+        let block_map = trace_try!(self.block_tree());
+        for block in &blocks {
+            let bi = trace_try!(block_map.get(&block)).unwrap(); // unwrap is fine as all blocks in must be present
+            let block_info: Block = serde_json::from_slice(&bi).unwrap(); // unwrap is fine as this would mean the DB is corrupted
+            let bytes = trace_try!(async_fs::read(block_info.disk_path(self.root.clone())).await);
+            size += bytes.len();
+            hasher.update(&bytes);
+        }
+        let e_tag = hasher.finalize().into();
+
+        let bc = trace_try!(self.bucket(&bucket));
+
+        let now = Utc::now().timestamp();
+        let object = Object {
+            size: size as u64,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            key: key.clone(),
+            blocks,
+            e_tag,
+        };
+
+        trace_try!(bc.insert(&key, Vec::<u8>::from(object)));
+
+        // Try to delete the multipart metadata. If this fails, it is not really an issue.
+        for part in multipart_upload.parts.into_iter().flatten() {
+            let part_key = format!(
+                "{}-{}-{}-{}",
+                &bucket,
+                &key,
+                &upload_id,
+                part.part_number.unwrap()
+            );
+
+            if let Err(e) = multipart_map.remove(part_key) {
+                eprintln!("Could not remove part: {}", e);
+            };
+        }
+
+        Ok(CompleteMultipartUploadOutput {
+            bucket: Some(bucket),
+            key: Some(key),
+            e_tag: Some(format!("\"{}\"", hex_string(&e_tag))),
+            ..CompleteMultipartUploadOutput::default()
+        })
     }
 
     async fn copy_object(
@@ -364,22 +518,41 @@ impl S3Storage for CasFS {
 
     async fn create_multipart_upload(
         &self,
-        input: s3_server::dto::CreateMultipartUploadRequest,
-    ) -> s3_server::errors::S3StorageResult<
-        s3_server::dto::CreateMultipartUploadOutput,
-        s3_server::dto::CreateMultipartUploadError,
-    > {
-        todo!()
+        input: CreateMultipartUploadRequest,
+    ) -> S3StorageResult<CreateMultipartUploadOutput, s3_server::dto::CreateMultipartUploadError>
+    {
+        let CreateMultipartUploadRequest { bucket, key, .. } = input;
+
+        let upload_id = Uuid::new_v4().to_string();
+
+        Ok(CreateMultipartUploadOutput {
+            bucket: Some(bucket),
+            key: Some(key),
+            upload_id: Some(upload_id),
+            ..CreateMultipartUploadOutput::default()
+        })
     }
 
     async fn create_bucket(
         &self,
-        input: s3_server::dto::CreateBucketRequest,
-    ) -> s3_server::errors::S3StorageResult<
-        s3_server::dto::CreateBucketOutput,
-        s3_server::dto::CreateBucketError,
-    > {
-        todo!()
+        input: CreateBucketRequest,
+    ) -> S3StorageResult<CreateBucketOutput, s3_server::dto::CreateBucketError> {
+        let CreateBucketRequest { bucket, .. } = input;
+
+        // TODO: check duplicate
+        let bucket_meta = trace_try!(self.bucket_meta_tree());
+
+        let bm = serde_json::to_vec(&BucketMeta {
+            name: bucket.clone(),
+            ctime: Utc::now().timestamp(),
+        })
+        .unwrap();
+
+        trace_try!(bucket_meta.insert(&bucket, bm));
+
+        Ok(CreateBucketOutput {
+            ..CreateBucketOutput::default()
+        })
     }
 
     async fn delete_bucket(
@@ -414,12 +587,19 @@ impl S3Storage for CasFS {
 
     async fn get_bucket_location(
         &self,
-        input: s3_server::dto::GetBucketLocationRequest,
-    ) -> s3_server::errors::S3StorageResult<
-        s3_server::dto::GetBucketLocationOutput,
-        s3_server::dto::GetBucketLocationError,
-    > {
-        todo!()
+        input: GetBucketLocationRequest,
+    ) -> S3StorageResult<GetBucketLocationOutput, s3_server::dto::GetBucketLocationError> {
+        let GetBucketLocationRequest { bucket, .. } = input;
+
+        let exists = trace_try!(self.bucket_exists(&bucket));
+
+        if !exists {
+            return Err(code_error!(NoSuchBucket, "NotFound").into());
+        }
+
+        Ok(GetBucketLocationOutput {
+            location_constraint: None,
+        })
     }
 
     async fn get_object(
@@ -434,12 +614,15 @@ impl S3Storage for CasFS {
 
     async fn head_bucket(
         &self,
-        input: s3_server::dto::HeadBucketRequest,
-    ) -> s3_server::errors::S3StorageResult<
-        s3_server::dto::HeadBucketOutput,
-        s3_server::dto::HeadBucketError,
-    > {
-        todo!()
+        input: HeadBucketRequest,
+    ) -> S3StorageResult<HeadBucketOutput, s3_server::dto::HeadBucketError> {
+        let HeadBucketRequest { bucket, .. } = input;
+
+        if !trace_try!(self.bucket_exists(&bucket)) {
+            return Err(code_error!(NoSuchBucket, "The specified bucket does not exist").into());
+        }
+
+        Ok(HeadBucketOutput)
     }
 
     async fn head_object(
@@ -454,32 +637,120 @@ impl S3Storage for CasFS {
 
     async fn list_buckets(
         &self,
-        input: s3_server::dto::ListBucketsRequest,
-    ) -> s3_server::errors::S3StorageResult<
-        s3_server::dto::ListBucketsOutput,
-        s3_server::dto::ListBucketsError,
-    > {
-        todo!()
+        _: ListBucketsRequest,
+    ) -> S3StorageResult<ListBucketsOutput, s3_server::dto::ListBucketsError> {
+        let buckets = trace_try!(self.buckets());
+
+        Ok(ListBucketsOutput {
+            buckets: Some(buckets),
+            owner: None,
+        })
     }
 
     async fn list_objects(
         &self,
-        input: s3_server::dto::ListObjectsRequest,
-    ) -> s3_server::errors::S3StorageResult<
-        s3_server::dto::ListObjectsOutput,
-        s3_server::dto::ListObjectsError,
-    > {
-        todo!()
+        input: ListObjectsRequest,
+    ) -> S3StorageResult<ListObjectsOutput, s3_server::dto::ListObjectsError> {
+        let ListObjectsRequest {
+            bucket,
+            delimiter,
+            prefix,
+            encoding_type,
+            ..
+        } = input;
+
+        let b = trace_try!(self.bucket(&bucket));
+
+        let objects = b
+            .scan_prefix(&prefix.as_ref().map(|v| v.as_str()).or(Some("")).unwrap())
+            .filter_map(|read_result| {
+                let (raw_key, raw_value) = match read_result {
+                    Ok((r, k)) => (r, k),
+                    Err(_) => return None,
+                };
+
+                // SAFETY: we only insert valid utf8 strings
+                let key = unsafe { String::from_utf8_unchecked(raw_key.to_vec()) };
+                // unwrap is fine as it would mean either a coding error or a corrupt DB
+                let obj = Object::try_from(&*raw_value).unwrap();
+
+                Some(S3Object {
+                    key: Some(key),
+                    e_tag: Some(format!("\"{}\"", hex_string(&obj.e_tag))),
+                    last_modified: Some(Utc.timestamp(obj.mtime, 0).to_rfc3339()),
+                    owner: None,
+                    size: Some(obj.size as i64),
+                    storage_class: None,
+                })
+            })
+            .collect();
+
+        Ok(ListObjectsOutput {
+            contents: Some(objects),
+            delimiter,
+            encoding_type,
+            name: Some(bucket),
+            common_prefixes: None,
+            is_truncated: None,
+            marker: None,
+            max_keys: None,
+            next_marker: None,
+            prefix,
+        })
     }
 
     async fn list_objects_v2(
         &self,
-        input: s3_server::dto::ListObjectsV2Request,
-    ) -> s3_server::errors::S3StorageResult<
-        s3_server::dto::ListObjectsV2Output,
-        s3_server::dto::ListObjectsV2Error,
-    > {
-        todo!()
+        input: ListObjectsV2Request,
+    ) -> S3StorageResult<ListObjectsV2Output, s3_server::dto::ListObjectsV2Error> {
+        let ListObjectsV2Request {
+            bucket,
+            delimiter,
+            prefix,
+            encoding_type,
+            ..
+        } = input;
+
+        let b = trace_try!(self.bucket(&bucket));
+
+        let objects: Vec<_> = b
+            .scan_prefix(&prefix.as_ref().map(|v| v.as_str()).or(Some("")).unwrap())
+            .filter_map(|read_result| {
+                let (raw_key, raw_value) = match read_result {
+                    Ok((r, k)) => (r, k),
+                    Err(_) => return None,
+                };
+
+                // SAFETY: we only insert valid utf8 strings
+                let key = unsafe { String::from_utf8_unchecked(raw_key.to_vec()) };
+                // unwrap is fine as it would mean either a coding error or a corrupt DB
+                let obj = Object::try_from(&*raw_value).unwrap();
+
+                Some(S3Object {
+                    key: Some(key),
+                    e_tag: Some(format!("\"{}\"", hex_string(&obj.e_tag))),
+                    last_modified: Some(Utc.timestamp(obj.mtime, 0).to_rfc3339()),
+                    owner: None,
+                    size: Some(obj.size as i64),
+                    storage_class: None,
+                })
+            })
+            .collect();
+
+        Ok(ListObjectsV2Output {
+            key_count: Some(objects.len() as i64),
+            contents: Some(objects),
+            common_prefixes: None,
+            delimiter,
+            continuation_token: None,
+            encoding_type,
+            is_truncated: None,
+            prefix,
+            name: Some(bucket),
+            max_keys: None,
+            start_after: None,
+            next_continuation_token: None,
+        })
     }
 
     async fn put_object(
@@ -494,11 +765,8 @@ impl S3Storage for CasFS {
 
     async fn upload_part(
         &self,
-        input: s3_server::dto::UploadPartRequest,
-    ) -> s3_server::errors::S3StorageResult<
-        s3_server::dto::UploadPartOutput,
-        s3_server::dto::UploadPartError,
-    > {
+        input: UploadPartRequest,
+    ) -> S3StorageResult<UploadPartOutput, s3_server::dto::UploadPartError> {
         let UploadPartRequest {
             body,
             bucket,
@@ -510,9 +778,41 @@ impl S3Storage for CasFS {
             ..
         } = input;
 
-        let body = body.ok_or_else(|| {
+        let body: ByteStream = body.ok_or_else(|| {
             code_error!(IncompleteBody, "You did not provide the number of bytes specified by the Content-Length HTTP header.")
         })?;
-        todo!()
+
+        let content_length = content_length.ok_or_else(|| {
+            code_error!(
+                MissingContentLength,
+                "You did not provide the number of bytes in the Content-Length HTTP header."
+            )
+        })?;
+
+        let mp_map = trace_try!(self.multipart_tree());
+
+        let (blocks, hash) = trace_try!(self.store_bytes(body).await);
+
+        let e_tag = format!("\"{}\"", hex_string(&hash));
+        let storage_key = format!("{}-{}-{}-{}", &bucket, &key, &upload_id, part_number);
+        let mp = MultiPart {
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            blocks,
+            hash,
+            size: content_length as usize,
+        };
+
+        // unwrap here is safe as it would be a coding error
+        let enc_mp = serde_json::to_vec(&mp).unwrap();
+
+        trace_try!(mp_map.insert(storage_key, enc_mp));
+
+        Ok(UploadPartOutput {
+            e_tag: Some(e_tag),
+            ..UploadPartOutput::default()
+        })
     }
 }

@@ -1,4 +1,6 @@
 //! internal macros
+// TODO: remove
+#![allow(unused_macros)]
 
 macro_rules! static_regex {
     ($re: literal) => {{
@@ -126,15 +128,16 @@ macro_rules! signature_mismatch {
 
 macro_rules! internal_error {
     ($e:expr) => {{
-        let code = $crate::errors::S3ErrorCode::InternalError;
-        let err = $crate::errors::S3Error::from_code(code)
+        let code = s3_server::errors::S3ErrorCode::InternalError;
+        let err = s3_server::errors::S3Error::from_code(code)
             .message("We encountered an internal error. Please try again.")
             .source($e)
             .capture_backtrace()
             .capture_span_trace()
             .finish();
 
-        tracing::error!("generated internal error: {}", err);
+        eprintln!("generated internal error: {}", err);
+        // tracing::error!("generated internal error: {}", err);
 
         err
     }};
