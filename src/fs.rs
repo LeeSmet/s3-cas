@@ -6,15 +6,17 @@ use futures::{
     sink::SinkExt,
     stream,
     stream::{StreamExt, TryStreamExt},
-    AsyncRead,
+    AsyncRead, Future, Stream,
 };
+use hyper::body::Bytes;
 use md5::{Digest, Md5};
 use s3_server::{
     dto::{
         Bucket, ByteStream, CompleteMultipartUploadError, CompleteMultipartUploadOutput,
         CompleteMultipartUploadRequest, CreateBucketOutput, CreateBucketRequest,
         CreateMultipartUploadOutput, CreateMultipartUploadRequest, GetBucketLocationOutput,
-        GetBucketLocationRequest, HeadBucketOutput, HeadBucketRequest, ListBucketsOutput,
+        GetBucketLocationRequest, GetObjectOutput, GetObjectRequest, HeadBucketOutput,
+        HeadBucketRequest, HeadObjectOutput, HeadObjectRequest, ListBucketsOutput,
         ListBucketsRequest, ListObjectsOutput, ListObjectsRequest, ListObjectsV2Output,
         ListObjectsV2Request, Object as S3Object,
     },
@@ -33,6 +35,8 @@ use std::{
     fmt::{self, Display, Formatter},
     io, mem,
     path::PathBuf,
+    pin::Pin,
+    task::{Context, Poll},
 };
 use uuid::Uuid;
 
@@ -408,6 +412,88 @@ impl Block {
     }
 }
 
+struct BlockStream {
+    paths: Vec<PathBuf>,
+    fp: usize,                    // pointer to current file path
+    file: Option<async_fs::File>, // current file to read
+    size: usize,
+    open_fut: Option<Pin<Box<dyn Future<Output = io::Result<async_fs::File>> + Send>>>,
+}
+
+impl BlockStream {
+    fn new(paths: Vec<PathBuf>, size: usize) -> Self {
+        Self {
+            paths,
+            fp: 0,
+            file: None,
+            size,
+            open_fut: None,
+        }
+    }
+}
+
+impl Stream for BlockStream {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // if we have an open file, try to read it
+        if let Some(ref mut file) = self.file {
+            let mut buf = vec![0; 4096];
+            return match Pin::new(file).poll_read(cx, &mut buf) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+                Poll::Ready(Ok(0)) => {
+                    self.file = None;
+                    self.poll_next(cx)
+                }
+                Poll::Ready(Ok(n)) => {
+                    buf.truncate(n);
+                    Poll::Ready(Some(Ok(buf.into())))
+                }
+            };
+        }
+
+        // we don't have an open file, check if we have any more left
+        if self.fp > self.paths.len() {
+            return Poll::Ready(None);
+        }
+
+        // try to open the next file
+        // if we are not opening one already start doing so
+        if self.open_fut.is_none() {
+            self.open_fut = Some(Box::pin(async_fs::File::open(self.paths[self.fp].clone())));
+            // increment the file pointer for the next file
+            self.fp += 1;
+        };
+
+        // this will always happen
+        if let Some(ref mut open_fut) = self.open_fut {
+            use futures::ready;
+            let file_res = ready!(open_fut.as_mut().poll(cx));
+            // we opened a file, or there is an error
+            // clear the open fut as it is done
+            self.open_fut = None;
+            match file_res {
+                // if there is an error, we just return that. The next poll call will try to open the
+                // next file
+                Err(e) => return Poll::Ready(Some(Err(e))),
+                // if we do have an open file, set it as open file, and immediatly poll again to try
+                // and read from it
+                Ok(file) => {
+                    self.file = Some(file);
+                    return self.poll_next(cx);
+                }
+            };
+        };
+
+        unreachable!();
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.size, Some(self.size))
+    }
+}
+
 #[async_trait]
 impl S3Storage for CasFS {
     async fn complete_multipart_upload(
@@ -604,12 +690,39 @@ impl S3Storage for CasFS {
 
     async fn get_object(
         &self,
-        input: s3_server::dto::GetObjectRequest,
-    ) -> s3_server::errors::S3StorageResult<
-        s3_server::dto::GetObjectOutput,
-        s3_server::dto::GetObjectError,
-    > {
-        todo!()
+        input: GetObjectRequest,
+    ) -> S3StorageResult<GetObjectOutput, s3_server::dto::GetObjectError> {
+        let GetObjectRequest { bucket, key, .. } = input;
+
+        let bk = trace_try!(self.bucket(&bucket));
+        let obj = match trace_try!(bk.get(&key)) {
+            None => return Err(code_error!(NoSuchKey, "The specified key does not exist").into()),
+            Some(obj) => obj,
+        };
+        let obj_meta = trace_try!(Object::try_from(&obj.to_vec()[..]));
+
+        let block_map = trace_try!(self.block_tree());
+        let mut paths = Vec::with_capacity(obj_meta.blocks.len());
+        let mut block_size = 0;
+        for block in obj_meta.blocks {
+            // unwrap here is safe as we only add blocks to the list of an object if they are
+            // corectly inserted in the block map
+            let block_meta_enc = trace_try!(block_map.get(block)).unwrap();
+            let block_meta = trace_try!(serde_json::from_slice::<Block>(&block_meta_enc));
+            block_size += block_meta.size;
+            paths.push(block_meta.disk_path(self.root.clone()));
+        }
+        debug_assert!(obj_meta.size as usize == block_size);
+        let block_stream = BlockStream::new(paths, block_size);
+
+        let stream = ByteStream::new_with_size(block_stream, obj_meta.size as usize);
+        Ok(GetObjectOutput {
+            body: Some(stream),
+            content_length: Some(obj_meta.size as i64),
+            last_modified: Some(Utc.timestamp(obj_meta.mtime, 0).to_rfc3339()),
+            e_tag: Some(format!("\"{}\"", hex_string(&obj_meta.e_tag))),
+            ..GetObjectOutput::default()
+        })
     }
 
     async fn head_bucket(
@@ -627,12 +740,22 @@ impl S3Storage for CasFS {
 
     async fn head_object(
         &self,
-        input: s3_server::dto::HeadObjectRequest,
-    ) -> s3_server::errors::S3StorageResult<
-        s3_server::dto::HeadObjectOutput,
-        s3_server::dto::HeadObjectError,
-    > {
-        todo!()
+        input: HeadObjectRequest,
+    ) -> S3StorageResult<HeadObjectOutput, s3_server::dto::HeadObjectError> {
+        let HeadObjectRequest { bucket, key, .. } = input;
+        let bk = trace_try!(self.bucket(&bucket));
+        let obj = match trace_try!(bk.get(&key)) {
+            None => return Err(code_error!(NoSuchKey, "The specified key does not exist").into()),
+            Some(obj) => obj,
+        };
+        let obj_meta = trace_try!(Object::try_from(&obj.to_vec()[..]));
+
+        Ok(HeadObjectOutput {
+            content_length: Some(obj_meta.size as i64),
+            last_modified: Some(Utc.timestamp(obj_meta.mtime, 0).to_rfc3339()),
+            e_tag: Some(format!("\"{}\"", hex_string(&obj_meta.e_tag))),
+            ..HeadObjectOutput::default()
+        })
     }
 
     async fn list_buckets(

@@ -803,7 +803,17 @@ checksum = "7b5a279bb9607f9f53c22d496eade00d138d1bdcccd07d74650387cf94942a15"
 dependencies = [
  "block-buffer",
  "digest",
+ "md5-asm",
  "opaque-debug",
+]
+
+[[package]]
+name = "md5-asm"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b47e5a1261ecd6ba951d1ad392534743310e513ef1e2609023368798829f33e"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
