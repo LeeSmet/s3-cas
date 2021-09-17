@@ -125,31 +125,33 @@ impl CasFS {
         let path_map = self.path_tree()?;
         let (tx, rx) = unbounded();
         let mut content_hash = Md5::new();
-        data.inspect(|bytes| {
-            content_hash.update(match bytes {
-                Ok(d) => d.as_ref(),
-                Err(_) => &[],
-            })
+        let data = BufferedByteStream::new(data);
+        data.map(|res| match res {
+            Ok(buffers) => buffers.into_iter().map(|buffer| Ok(buffer)).collect(),
+            Err(e) => vec![Err(e)],
         })
-        // TODO: fix this to pull bytes, not results, and to write as soon as possible
-        .chunks(BLOCK_SIZE)
+        .map(|i| stream::iter(i))
+        .flatten()
+        .inspect(|maybe_bytes| {
+            if let Ok(bytes) = maybe_bytes {
+                content_hash.update(bytes);
+            }
+        })
         .zip(stream::repeat((tx, block_map, path_map)))
         .for_each_concurrent(
             5,
-            |(byte_chunk, (mut tx, block_map, path_map))| async move {
-                for res in &byte_chunk {
-                    if let Err(e) = res {
-                        if let Err(e) = tx
-                            .send(Err(std::io::Error::new(e.kind(), e.to_string())))
-                            .await
-                        {
-                            eprintln!("Could not convey result: {}", e);
-                        }
-                        return;
+            |(maybe_chunk, (mut tx, block_map, path_map))| async move {
+                if let Err(e) = maybe_chunk {
+                    if let Err(e) = tx
+                        .send(Err(std::io::Error::new(e.kind(), e.to_string())))
+                        .await
+                    {
+                        eprintln!("Could not convey result: {}", e);
                     }
+                    return;
                 }
                 // unwrap is safe as we checked that there is no error above
-                let bytes: Vec<u8> = byte_chunk.into_iter().flat_map(|r| r.unwrap()).collect();
+                let bytes: Vec<u8> = maybe_chunk.unwrap();
                 let mut hasher = Md5::new();
                 hasher.update(&bytes);
                 let block_hash: BlockID = hasher.finalize().into();
@@ -478,7 +480,7 @@ impl Stream for BlockStream {
                 // if there is an error, we just return that. The next poll call will try to open the
                 // next file
                 Err(e) => return Poll::Ready(Some(Err(e))),
-                // if we do have an open file, set it as open file, and immediatly poll again to try
+                // if we do have an open file, set it as open file, and immediately poll again to try
                 // and read from it
                 Ok(file) => {
                     self.file = Some(file);
@@ -492,6 +494,84 @@ impl Stream for BlockStream {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.size, Some(self.size))
+    }
+}
+
+struct BufferedByteStream {
+    // In a perfect world this would be an AsyncRead type, as that will likely be more performant
+    // than reading bytes, and copying them. However the AyndRead implemented on this type is the
+    // tokio one, which is not the same as the futures one. And I don't feel like adding a tokio
+    // dependency here right now for that.
+    // TODO: benchmark both approaches
+    bs: ByteStream,
+    buffer: Vec<u8>,
+    finished: bool,
+}
+
+impl BufferedByteStream {
+    fn new(bs: ByteStream) -> Self {
+        Self {
+            bs,
+            buffer: Vec::with_capacity(BLOCK_SIZE),
+            finished: false,
+        }
+    }
+}
+
+impl Stream for BufferedByteStream {
+    type Item = io::Result<Vec<Vec<u8>>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            match ready!(Pin::new(&mut self.bs).poll_next(cx)) {
+                None => {
+                    self.finished = true;
+                    if self.buffer.len() > 0 {
+                        // since we won't be using the vec anymore, we can replace it with a 0 capacity
+                        // vec. This wont' allocate.
+                        return Poll::Ready(Some(Ok(vec![mem::replace(
+                            &mut self.buffer,
+                            Vec::with_capacity(0),
+                        )])));
+                    }
+                    return Poll::Ready(None);
+                }
+                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Some(Ok(bytes)) => {
+                    let mut buf_remainder = self.buffer.capacity() - self.buffer.len();
+                    if bytes.len() < buf_remainder {
+                        self.buffer.extend_from_slice(&bytes);
+                    } else if self.buffer.len() == buf_remainder {
+                        self.buffer.extend_from_slice(&bytes);
+                        return Poll::Ready(Some(Ok(vec![mem::replace(
+                            &mut self.buffer,
+                            Vec::with_capacity(BLOCK_SIZE),
+                        )])));
+                    } else {
+                        let mut out = Vec::with_capacity(
+                            (bytes.len() - buf_remainder) / self.buffer.capacity() + 1,
+                        );
+                        self.buffer.extend_from_slice(&bytes[..buf_remainder]);
+                        out.push(mem::replace(
+                            &mut self.buffer,
+                            Vec::with_capacity(BLOCK_SIZE),
+                        ));
+                        // repurpose buf_remainder as pointer to start of data
+                        while bytes[buf_remainder..].len() > BLOCK_SIZE {
+                            out.push(Vec::from(&bytes[buf_remainder..buf_remainder + BLOCK_SIZE]));
+                            buf_remainder += BLOCK_SIZE;
+                        }
+                        // place the remainder in our buf
+                        self.buffer.extend_from_slice(&bytes[buf_remainder..]);
+                        return Poll::Ready(Some(Ok(out)));
+                    };
+                }
+            };
+        }
     }
 }
 
