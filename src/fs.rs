@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::prelude::*;
 use faster_hex::hex_string;
+use futures::ready;
 use futures::{
     channel::mpsc::unbounded,
     sink::SinkExt,
@@ -412,6 +413,7 @@ impl Block {
     }
 }
 
+/// Implementation of a single stream over potentially multiple on disk data block files.
 struct BlockStream {
     paths: Vec<PathBuf>,
     fp: usize,                    // pointer to current file path
@@ -468,7 +470,6 @@ impl Stream for BlockStream {
 
         // this will always happen
         if let Some(ref mut open_fut) = self.open_fut {
-            use futures::ready;
             let file_res = ready!(open_fut.as_mut().poll(cx));
             // we opened a file, or there is an error
             // clear the open fut as it is done
