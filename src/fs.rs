@@ -11,6 +11,12 @@ use futures::{
 };
 use hyper::body::Bytes;
 use md5::{Digest, Md5};
+use s3_server::dto::{
+    CopyObjectOutput, CopyObjectRequest, CopyObjectResult, DeleteBucketOutput, DeleteBucketRequest,
+    DeleteObjectOutput, DeleteObjectRequest, DeleteObjectsOutput, DeleteObjectsRequest,
+    DeletedObject, PutObjectOutput, PutObjectRequest,
+};
+use s3_server::headers::AmzCopySource;
 use s3_server::{
     dto::{
         Bucket, ByteStream, CompleteMultipartUploadError, CompleteMultipartUploadOutput,
@@ -92,9 +98,17 @@ impl CasFS {
         self.db.open_tree(bucket_name)
     }
 
-    /// Open the tree containing the bucket metadata
+    /// Open the tree containing the bucket metadata.
     fn bucket_meta_tree(&self) -> Result<sled::Tree, sled::Error> {
         self.db.open_tree(BUCKET_META_TREE)
+    }
+
+    /// Remove a bucket and its associated metadata.
+    fn bucket_delete(&self, bucket: &str) -> Result<(), sled::Error> {
+        let bmt = self.bucket_meta_tree()?;
+        bmt.remove(bucket)?;
+        self.db.drop_tree(bucket)?;
+        Ok(())
     }
 
     /// Get a list of all buckets in the system.
@@ -119,13 +133,14 @@ impl CasFS {
     }
 
     /// Save data on the filesystem. A list of block ID's used as keys for the data blocks is
-    /// returned, along with the hash of the full byte stream.
-    async fn store_bytes(&self, data: ByteStream) -> io::Result<(Vec<BlockID>, BlockID)> {
+    /// returned, along with the hash of the full byte stream, and the length of the stream.
+    async fn store_bytes(&self, data: ByteStream) -> io::Result<(Vec<BlockID>, BlockID, u64)> {
         let block_map = self.block_tree()?;
         let path_map = self.path_tree()?;
         let (tx, rx) = unbounded();
         let mut content_hash = Md5::new();
         let data = BufferedByteStream::new(data);
+        let mut size = 0;
         data.map(|res| match res {
             Ok(buffers) => buffers.into_iter().map(|buffer| Ok(buffer)).collect(),
             Err(e) => vec![Err(e)],
@@ -135,6 +150,7 @@ impl CasFS {
         .inspect(|maybe_bytes| {
             if let Ok(bytes) = maybe_bytes {
                 content_hash.update(bytes);
+                size += bytes.len() as u64;
             }
         })
         .zip(stream::repeat((tx, block_map, path_map)))
@@ -170,7 +186,6 @@ impl CasFS {
 
                         // find a free path
                         for index in 1..BLOCKID_SIZE {
-                            println!("Checking path {}", hex_string(&block_hash[..index]));
                             if paths.get(&block_hash[..index])?.is_some() {
                                 // path already used, try the next one
                                 continue;
@@ -250,6 +265,7 @@ impl CasFS {
         Ok((
             rx.try_collect::<Vec<BlockID>>().await?,
             content_hash.finalize().into(),
+            size,
         ))
     }
 }
@@ -299,8 +315,8 @@ struct Object {
     blocks: Vec<BlockID>,
 }
 
-impl From<Object> for Vec<u8> {
-    fn from(o: Object) -> Self {
+impl From<&Object> for Vec<u8> {
+    fn from(o: &Object) -> Self {
         let mut data = Vec::with_capacity(
             32 + BLOCKID_SIZE + 8 + o.key.len() + 8 + o.blocks.len() * BLOCKID_SIZE,
         );
@@ -313,8 +329,8 @@ impl From<Object> for Vec<u8> {
         data.extend_from_slice(&o.key.len().to_le_bytes());
         data.extend_from_slice(o.key.as_bytes());
         data.extend_from_slice(&o.blocks.len().to_le_bytes());
-        for block in o.blocks {
-            data.extend_from_slice(&block);
+        for block in &o.blocks {
+            data.extend_from_slice(block);
         }
 
         data
@@ -648,7 +664,7 @@ impl S3Storage for CasFS {
             e_tag,
         };
 
-        trace_try!(bc.insert(&key, Vec::<u8>::from(object)));
+        trace_try!(bc.insert(&key, Vec::<u8>::from(&object)));
 
         // Try to delete the multipart metadata. If this fails, it is not really an issue.
         for part in multipart_upload.parts.into_iter().flatten() {
@@ -675,12 +691,46 @@ impl S3Storage for CasFS {
 
     async fn copy_object(
         &self,
-        input: s3_server::dto::CopyObjectRequest,
-    ) -> s3_server::errors::S3StorageResult<
-        s3_server::dto::CopyObjectOutput,
-        s3_server::dto::CopyObjectError,
-    > {
-        todo!()
+        input: CopyObjectRequest,
+    ) -> S3StorageResult<CopyObjectOutput, s3_server::dto::CopyObjectError> {
+        let copy_source = AmzCopySource::from_header_str(&input.copy_source)
+            .map_err(|err| invalid_request!("Invalid header: x-amz-copy-source", err))?;
+
+        let (bucket, key) = match copy_source {
+            AmzCopySource::AccessPoint { .. } => {
+                return Err(not_supported!("Access point is not supported yet.").into())
+            }
+            AmzCopySource::Bucket { bucket, key } => (bucket, key),
+        };
+
+        if !trace_try!(self.bucket_exists(&bucket)) {
+            return Err(code_error!(NoSuchBucket, "Target bucket does not exist").into());
+        }
+
+        let source_bk = trace_try!(self.bucket(&input.bucket));
+        let mut obj_meta = match trace_try!(source_bk.get(&input.key)) {
+            // unwrap here is safe as it means the DB is corrupted
+            Some(enc_meta) => Object::try_from(&*enc_meta).unwrap(),
+            None => return Err(code_error!(NoSuchKey, "Source key does not exist").into()),
+        };
+
+        let now = Utc::now().timestamp();
+        obj_meta.mtime = now;
+        obj_meta.atime = now;
+        obj_meta.ctime = now;
+        obj_meta.key = key.to_string();
+
+        // TODO: check duplicate?
+        let dst_bk = trace_try!(self.bucket(&bucket));
+        trace_try!(dst_bk.insert(key, Vec::<u8>::from(&obj_meta)));
+
+        Ok(CopyObjectOutput {
+            copy_object_result: Some(CopyObjectResult {
+                e_tag: Some(format!("\"{}\"", hex_string(&obj_meta.e_tag))),
+                last_modified: Some(Utc.timestamp(now, 0).to_rfc3339()),
+            }),
+            ..CopyObjectOutput::default()
+        })
     }
 
     async fn create_multipart_upload(
@@ -706,7 +756,13 @@ impl S3Storage for CasFS {
     ) -> S3StorageResult<CreateBucketOutput, s3_server::dto::CreateBucketError> {
         let CreateBucketRequest { bucket, .. } = input;
 
-        // TODO: check duplicate
+        if trace_try!(self.bucket_exists(&bucket)) {
+            return Err(code_error!(
+                BucketAlreadyExists,
+                "A bucket with this name already exists"
+            )
+            .into());
+        }
         let bucket_meta = trace_try!(self.bucket_meta_tree());
 
         let bm = serde_json::to_vec(&BucketMeta {
@@ -724,32 +780,73 @@ impl S3Storage for CasFS {
 
     async fn delete_bucket(
         &self,
-        input: s3_server::dto::DeleteBucketRequest,
-    ) -> s3_server::errors::S3StorageResult<
-        s3_server::dto::DeleteBucketOutput,
-        s3_server::dto::DeleteBucketError,
-    > {
-        todo!()
+        input: DeleteBucketRequest,
+    ) -> S3StorageResult<DeleteBucketOutput, s3_server::dto::DeleteBucketError> {
+        let DeleteBucketRequest { bucket, .. } = input;
+
+        trace_try!(self.bucket_delete(&bucket));
+
+        Ok(DeleteBucketOutput)
     }
 
     async fn delete_object(
         &self,
-        input: s3_server::dto::DeleteObjectRequest,
-    ) -> s3_server::errors::S3StorageResult<
-        s3_server::dto::DeleteObjectOutput,
-        s3_server::dto::DeleteObjectError,
-    > {
-        todo!()
+        input: DeleteObjectRequest,
+    ) -> S3StorageResult<DeleteObjectOutput, s3_server::dto::DeleteObjectError> {
+        let DeleteObjectRequest { bucket, key, .. } = input;
+
+        if !trace_try!(self.bucket_exists(&bucket)) {
+            return Err(code_error!(NoSuchBucket, "Bucket does not exist").into());
+        }
+
+        trace_try!(trace_try!(self.bucket(&bucket)).remove(&key));
+
+        Ok(DeleteObjectOutput::default())
     }
 
     async fn delete_objects(
         &self,
-        input: s3_server::dto::DeleteObjectsRequest,
+        input: DeleteObjectsRequest,
     ) -> s3_server::errors::S3StorageResult<
         s3_server::dto::DeleteObjectsOutput,
         s3_server::dto::DeleteObjectsError,
     > {
-        todo!()
+        if !trace_try!(self.bucket_exists(&input.bucket)) {
+            return Err(code_error!(NoSuchBucket, "Bucket does not exist").into());
+        }
+        let bucket = trace_try!(self.bucket(&input.bucket));
+
+        let mut deleted = Vec::with_capacity(input.delete.objects.len());
+        let mut errors = Vec::new();
+
+        for object in input.delete.objects {
+            match bucket.remove(&object.key) {
+                Ok(_) => {
+                    deleted.push(DeletedObject {
+                        key: Some(object.key),
+                        ..DeletedObject::default()
+                    });
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Could not remove key {} from bucket {}",
+                        &object.key, &input.bucket
+                    );
+                    // TODO
+                    // errors.push(code_error!(InternalError, "Could not delete key"));
+                }
+            };
+        }
+
+        Ok(DeleteObjectsOutput {
+            deleted: Some(deleted),
+            errors: if errors.len() == 0 {
+                None
+            } else {
+                Some(errors)
+            },
+            ..DeleteObjectsOutput::default()
+        })
     }
 
     async fn get_bucket_location(
@@ -959,12 +1056,50 @@ impl S3Storage for CasFS {
 
     async fn put_object(
         &self,
-        input: s3_server::dto::PutObjectRequest,
-    ) -> s3_server::errors::S3StorageResult<
-        s3_server::dto::PutObjectOutput,
-        s3_server::dto::PutObjectError,
-    > {
-        todo!()
+        input: PutObjectRequest,
+    ) -> S3StorageResult<PutObjectOutput, s3_server::dto::PutObjectError> {
+        if let Some(ref storage_class) = input.storage_class {
+            let is_valid = ["STANDARD", "REDUCED_REDUNDANCY"].contains(&storage_class.as_str());
+            if !is_valid {
+                let err = code_error!(
+                    InvalidStorageClass,
+                    "The storage class you specified is not valid."
+                );
+                return Err(err.into());
+            }
+        }
+
+        let PutObjectRequest {
+            body, bucket, key, ..
+        } = input;
+
+        let body: ByteStream = body.ok_or_else(|| {
+            code_error!(IncompleteBody, "You did not provide the number of bytes specified by the Content-Length HTTP header.")
+        })?;
+
+        if !trace_try!(self.bucket_exists(&bucket)) {
+            return Err(code_error!(NoSuchBucket, "Bucket does not exist").into());
+        }
+
+        let (blocks, hash, size) = trace_try!(self.store_bytes(body).await);
+        let e_tag = format!("\"{}\"", hex_string(&hash));
+        let now = Utc::now().timestamp();
+        let obj_meta = Object {
+            size,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            e_tag: hash,
+            blocks,
+            key: key.clone(),
+        };
+
+        trace_try!(trace_try!(self.bucket(&bucket)).insert(&key, Vec::<u8>::from(&obj_meta)));
+
+        Ok(PutObjectOutput {
+            e_tag: Some(e_tag),
+            ..PutObjectOutput::default()
+        })
     }
 
     async fn upload_part(
@@ -993,9 +1128,17 @@ impl S3Storage for CasFS {
             )
         })?;
 
-        let mp_map = trace_try!(self.multipart_tree());
+        let (blocks, hash, size) = trace_try!(self.store_bytes(body).await);
 
-        let (blocks, hash) = trace_try!(self.store_bytes(body).await);
+        if size != content_length as u64 {
+            return Err(code_error!(
+                InvalidRequest,
+                "You did not send the amount of bytes specified by the Content-Length HTTP header."
+            )
+            .into());
+        }
+
+        let mp_map = trace_try!(self.multipart_tree());
 
         let e_tag = format!("\"{}\"", hex_string(&hash));
         let storage_key = format!("{}-{}-{}-{}", &bucket, &key, &upload_id, part_number);
@@ -1006,7 +1149,7 @@ impl S3Storage for CasFS {
             part_number,
             blocks,
             hash,
-            size: content_length as usize,
+            size: size as usize,
         };
 
         // unwrap here is safe as it would be a coding error
