@@ -54,6 +54,7 @@ const PATH_TREE: &str = "_PATHS";
 const MULTIPART_TREE: &str = "_MULTIPART_PARTS";
 const BLOCKID_SIZE: usize = 16;
 const PTR_SIZE: usize = mem::size_of::<usize>(); // Size of a `usize` in bytes
+const MAX_KEYS: i64 = 1000;
 
 type BlockID = [u8; BLOCKID_SIZE]; // Size of an md5 hash
 
@@ -629,9 +630,16 @@ impl S3Storage for CasFS {
                 )));
             }
             let part_key = format!("{}-{}-{}-{}", &bucket, &key, &upload_id, part_number);
-            let part_data_enc = trace_try!(multipart_map.get(part_key));
-            let part_data_enc = trace_try!(part_data_enc
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Part not uploaded")));
+            let part_data_enc = trace_try!(multipart_map.get(&part_key));
+            let part_data_enc = match part_data_enc {
+                Some(pde) => pde,
+                None => {
+                    eprintln!("Missing part \"{}\" in multipart upload", part_key);
+                    return Err(code_error!(InvalidArgument, "Part not uploaded").into());
+                }
+            };
+            //let part_data_enc = trace_try!(part_data_enc
+            //    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Part not uploaded")));
 
             // unwrap here is safe as it is a coding error
             let mp: MultiPart = serde_json::from_slice(&part_data_enc).unwrap();
@@ -957,34 +965,56 @@ impl S3Storage for CasFS {
             delimiter,
             prefix,
             encoding_type,
+            marker,
+            max_keys,
             ..
         } = input;
 
+        let key_count = max_keys
+            .and_then(|mk| {
+                if mk > MAX_KEYS {
+                    Some(MAX_KEYS)
+                } else {
+                    Some(mk)
+                }
+            })
+            .unwrap_or(MAX_KEYS);
+
         let b = trace_try!(self.bucket(&bucket));
 
-        let objects = b
-            .scan_prefix(&prefix.as_ref().map(|v| v.as_str()).or(Some("")).unwrap())
-            .filter_map(|read_result| {
-                let (raw_key, raw_value) = match read_result {
-                    Ok((r, k)) => (r, k),
-                    Err(_) => return None,
-                };
-
+        let mut objects = b
+            .scan_prefix(&prefix.as_deref().or(Some("")).unwrap())
+            .filter_map(|read_result| match read_result {
+                Ok((r, k)) => Some((r, k)),
+                Err(_) => None,
+            })
+            .skip_while(|(raw_key, _)| match marker {
+                None => false,
+                Some(ref marker) => raw_key <= &sled::IVec::from(marker.as_bytes()),
+            })
+            .map(|(raw_key, raw_value)| {
                 // SAFETY: we only insert valid utf8 strings
                 let key = unsafe { String::from_utf8_unchecked(raw_key.to_vec()) };
                 // unwrap is fine as it would mean either a coding error or a corrupt DB
                 let obj = Object::try_from(&*raw_value).unwrap();
 
-                Some(S3Object {
+                S3Object {
                     key: Some(key),
                     e_tag: Some(format!("\"{}\"", hex_string(&obj.e_tag))),
                     last_modified: Some(Utc.timestamp(obj.mtime, 0).to_rfc3339()),
                     owner: None,
                     size: Some(obj.size as i64),
                     storage_class: None,
-                })
+                }
             })
-            .collect();
+            .take((key_count + 1) as usize)
+            .collect::<Vec<_>>();
+
+        let mut next_marker = None;
+        let truncated = objects.len() == key_count as usize + 1;
+        if truncated {
+            next_marker = Some(objects.pop().unwrap().key.unwrap())
+        }
 
         Ok(ListObjectsOutput {
             contents: Some(objects),
@@ -992,10 +1022,10 @@ impl S3Storage for CasFS {
             encoding_type,
             name: Some(bucket),
             common_prefixes: None,
-            is_truncated: None,
-            marker: None,
-            max_keys: None,
-            next_marker: None,
+            is_truncated: Some(truncated),
+            marker,
+            max_keys: Some(key_count),
+            next_marker,
             prefix,
         })
     }

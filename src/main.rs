@@ -1,4 +1,4 @@
-use s3_cas::fs::CasFS;
+use s3_cas::{fs::CasFS, passthrough::Passthrough};
 use s3_server::S3Service;
 use s3_server::SimpleAuth;
 
@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
     // debug!(?fs);
 
     // setup the service
+    // let mut service = S3Service::new(Passthrough::new(fs));
     let mut service = S3Service::new(fs);
 
     if let (Some(access_key), Some(secret_key)) = (args.access_key, args.secret_key) {

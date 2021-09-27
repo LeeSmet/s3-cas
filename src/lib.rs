@@ -2,3 +2,4 @@
 mod internal_macros;
 
 pub mod fs;
+pub mod passthrough;

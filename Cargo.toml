@@ -23,6 +23,11 @@ vendored = [
 name = "s3-cas"
 required-features = ["binary"]
 
+[[bin]]
+name = "show-multipart"
+required-features = ["binary"]
+path = "src/show_multipart.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"], optional = true }
 s3-server = "0.1"
