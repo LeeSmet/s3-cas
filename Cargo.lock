@@ -1381,8 +1381,6 @@ dependencies = [
  "openssl",
  "pin-project-lite 0.2.7",
  "s3-server",
- "serde",
- "serde_json",
  "sled",
  "structopt",
  "tokio",

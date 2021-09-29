@@ -35,7 +35,6 @@ use s3_server::{
     dto::{UploadPartOutput, UploadPartRequest},
     errors::S3StorageError,
 };
-use serde::{Deserialize, Serialize};
 use sled::{Db, IVec, Transactional};
 use std::{
     convert::{TryFrom, TryInto},
