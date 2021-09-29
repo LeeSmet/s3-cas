@@ -1023,9 +1023,9 @@ impl S3Storage for CasFS {
             name: Some(bucket),
             common_prefixes: None,
             is_truncated: Some(truncated),
+            next_marker: if marker.is_some() { next_marker } else { None },
             marker,
             max_keys: Some(key_count),
-            next_marker,
             prefix,
         })
     }
