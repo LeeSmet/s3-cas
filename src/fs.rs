@@ -688,8 +688,6 @@ impl S3Storage for CasFS {
                     return Err(code_error!(InvalidArgument, "Part not uploaded").into());
                 }
             };
-            //let part_data_enc = trace_try!(part_data_enc
-            //    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Part not uploaded")));
 
             // unwrap here is safe as it is a coding error
             let mp: MultiPart = serde_json::from_slice(&part_data_enc).unwrap();
@@ -697,15 +695,16 @@ impl S3Storage for CasFS {
             blocks.extend_from_slice(&mp.blocks);
         }
 
+        // Compute the e_tag of the multpart upload. Per the S3 standard (according to minio), the
+        // e_tag of a multipart uploaded object is the Md5 of the Md5 of the parts.
         let mut hasher = Md5::new();
         let mut size = 0;
         let block_map = trace_try!(self.block_tree());
         for block in &blocks {
             let bi = trace_try!(block_map.get(&block)).unwrap(); // unwrap is fine as all blocks in must be present
             let block_info = Block::try_from(&*bi).expect("Block data is corrupt");
-            let bytes = trace_try!(async_fs::read(block_info.disk_path(self.root.clone())).await);
-            size += bytes.len();
-            hasher.update(&bytes);
+            size += block_info.size;
+            hasher.update(&block);
         }
         let e_tag = hasher.finalize().into();
 
