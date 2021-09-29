@@ -200,9 +200,7 @@ impl CasFS {
                                 path: block_hash[..index].to_vec(),
                             };
 
-                            // unwrap here is fine since that would be a coding error
-                            let block_meta = serde_json::to_vec(&block).unwrap();
-                            blocks.insert(&block_hash, block_meta)?;
+                            blocks.insert(&block_hash, Vec::from(&block))?;
                             return Ok(true);
                         }
 
@@ -232,8 +230,9 @@ impl CasFS {
                 // write the actual block
                 // first load the block again from the DB
                 let block: Block = match block_map.get(block_hash) {
-                    // unwrap here is fine as that would be a coding error
-                    Ok(Some(encoded_block)) => serde_json::from_slice(&encoded_block).unwrap(),
+                    Ok(Some(encoded_block)) => (&*encoded_block)
+                        .try_into()
+                        .expect("Block data is corrupted"),
                     // we just inserted this block, so this is by definition impossible
                     Ok(None) => unreachable!(),
                     Err(e) => {
@@ -394,10 +393,44 @@ impl TryFrom<&[u8]> for Object {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+// TODO: this can be optimized by making path a `[u8;BLOCKID_SIZE]` and keeping track of a len u8
+#[derive(Debug)]
 struct Block {
     size: usize,
     path: Vec<u8>,
+}
+
+impl From<&Block> for Vec<u8> {
+    fn from(b: &Block) -> Self {
+        // NOTE: we encode the lenght of the vector as a single byte, since it can only be 16 bytes
+        // long.
+        let mut out = Vec::with_capacity(PTR_SIZE + b.path.len() + 1);
+        out.extend_from_slice(&b.size.to_le_bytes());
+        out.extend_from_slice(&(b.path.len() as u8).to_le_bytes());
+        out.extend_from_slice(&b.path);
+        out
+    }
+}
+
+impl TryFrom<&[u8]> for Block {
+    type Error = FsError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        if value.len() < PTR_SIZE + 1 {
+            return Err(FsError::MalformedObject);
+        }
+        let size = usize::from_le_bytes(value[..PTR_SIZE].try_into().unwrap());
+        let vec_size =
+            u8::from_le_bytes(value[PTR_SIZE..PTR_SIZE + 1].try_into().unwrap()) as usize;
+        if value.len() != PTR_SIZE + 1 + vec_size {
+            return Err(FsError::MalformedObject);
+        }
+
+        Ok(Block {
+            size,
+            path: value[PTR_SIZE + 1..].to_vec(),
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -652,7 +685,7 @@ impl S3Storage for CasFS {
         let block_map = trace_try!(self.block_tree());
         for block in &blocks {
             let bi = trace_try!(block_map.get(&block)).unwrap(); // unwrap is fine as all blocks in must be present
-            let block_info: Block = serde_json::from_slice(&bi).unwrap(); // unwrap is fine as this would mean the DB is corrupted
+            let block_info = Block::try_from(&*bi).expect("Block data is corrupt");
             let bytes = trace_try!(async_fs::read(block_info.disk_path(self.root.clone())).await);
             size += bytes.len();
             hasher.update(&bytes);
@@ -894,7 +927,7 @@ impl S3Storage for CasFS {
             // unwrap here is safe as we only add blocks to the list of an object if they are
             // corectly inserted in the block map
             let block_meta_enc = trace_try!(block_map.get(block)).unwrap();
-            let block_meta = trace_try!(serde_json::from_slice::<Block>(&block_meta_enc));
+            let block_meta = trace_try!(Block::try_from(&*block_meta_enc));
             block_size += block_meta.size;
             paths.push(block_meta.disk_path(self.root.clone()));
         }
