@@ -124,7 +124,7 @@ impl CasFS {
                     Ok(v) => v,
                 };
                 // unwrap here is fine as it means the db is corrupt
-                let bucket_meta = serde_json::from_slice::<BucketMeta>(&value).unwrap();
+                let bucket_meta = BucketMeta::try_from(&*value).expect("Corrupted bucket metadata");
                 Some(Bucket {
                     name: Some(bucket_meta.name),
                     creation_date: Some(Utc.timestamp(bucket_meta.ctime, 0).to_rfc3339()),
@@ -307,27 +307,34 @@ impl From<sled::Error> for FsError {
 #[derive(Debug)]
 struct Object {
     size: u64,
-    atime: i64,
     ctime: i64,
-    mtime: i64,
     e_tag: BlockID,
-    key: String, // TODO: is this even needed?
+    // The amount of parts uploaded for this object. In case of a simple put_object, this will be
+    // 0. In case of a multipart upload, this wil equal the amount of individual parts. This is
+    // required so we can properly construct the formatted hash later.
+    parts: usize,
     blocks: Vec<BlockID>,
+}
+
+impl Object {
+    fn format_e_tag(&self) -> String {
+        if self.parts == 0 {
+            format!("\"{}\"", hex_string(&self.e_tag))
+        } else {
+            format!("\"{}-{}\"", hex_string(&self.e_tag), self.parts)
+        }
+    }
 }
 
 impl From<&Object> for Vec<u8> {
     fn from(o: &Object) -> Self {
-        let mut data = Vec::with_capacity(
-            32 + BLOCKID_SIZE + 8 + o.key.len() + 8 + o.blocks.len() * BLOCKID_SIZE,
-        );
+        let mut data =
+            Vec::with_capacity(16 + BLOCKID_SIZE + PTR_SIZE * 2 + o.blocks.len() * BLOCKID_SIZE);
 
         data.extend_from_slice(&o.size.to_le_bytes());
-        data.extend_from_slice(&o.atime.to_le_bytes());
         data.extend_from_slice(&o.ctime.to_le_bytes());
-        data.extend_from_slice(&o.mtime.to_le_bytes());
         data.extend_from_slice(&o.e_tag);
-        data.extend_from_slice(&o.key.len().to_le_bytes());
-        data.extend_from_slice(o.key.as_bytes());
+        data.extend_from_slice(&o.parts.to_le_bytes());
         data.extend_from_slice(&o.blocks.len().to_le_bytes());
         for block in &o.blocks {
             data.extend_from_slice(block);
@@ -341,53 +348,35 @@ impl TryFrom<&[u8]> for Object {
     type Error = FsError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() < 32 + BLOCKID_SIZE + PTR_SIZE {
+        if value.len() < 16 + BLOCKID_SIZE + 2 * PTR_SIZE {
             return Err(FsError::MalformedObject);
         }
-        // unwrap is safe since we checked the lenght of the object
-        let key_len = usize::from_le_bytes(
-            value[32 + BLOCKID_SIZE..32 + BLOCKID_SIZE + PTR_SIZE]
-                .try_into()
-                .unwrap(),
-        );
-        // already check the block length is included here
-        if value.len() < 32 + BLOCKID_SIZE + PTR_SIZE + key_len + PTR_SIZE {
-            return Err(FsError::MalformedObject);
-        }
-        // SAFETY: This is safe as we only fill in valid strings when storing, and we checked the
-        // length of the data
-        let key = unsafe {
-            String::from_utf8_unchecked(
-                value[32 + PTR_SIZE + BLOCKID_SIZE..32 + PTR_SIZE + BLOCKID_SIZE + key_len]
-                    .to_vec(),
-            )
-        };
 
         let block_len = usize::from_le_bytes(
-            value[32 + PTR_SIZE + BLOCKID_SIZE + key_len
-                ..32 + PTR_SIZE + BLOCKID_SIZE + key_len + PTR_SIZE]
+            value[16 + BLOCKID_SIZE + PTR_SIZE..16 + BLOCKID_SIZE + 2 * PTR_SIZE]
                 .try_into()
                 .unwrap(),
         );
 
-        if value.len() != 32 + 2 * PTR_SIZE + BLOCKID_SIZE + key_len + block_len * BLOCKID_SIZE {
+        if value.len() != 16 + 2 * PTR_SIZE + BLOCKID_SIZE + block_len * BLOCKID_SIZE {
             return Err(FsError::MalformedObject);
         }
 
         let mut blocks = Vec::with_capacity(block_len);
 
-        for chunk in value[32 + 2 * PTR_SIZE + BLOCKID_SIZE + key_len..].chunks_exact(BLOCKID_SIZE)
-        {
+        for chunk in value[16 + 2 * PTR_SIZE + BLOCKID_SIZE..].chunks_exact(BLOCKID_SIZE) {
             blocks.push(chunk.try_into().unwrap());
         }
 
         Ok(Object {
             size: u64::from_le_bytes(value[0..8].try_into().unwrap()),
-            atime: i64::from_le_bytes(value[8..16].try_into().unwrap()),
-            ctime: i64::from_le_bytes(value[16..24].try_into().unwrap()),
-            mtime: i64::from_le_bytes(value[24..32].try_into().unwrap()),
-            e_tag: value[32..32 + BLOCKID_SIZE].try_into().unwrap(),
-            key,
+            ctime: i64::from_le_bytes(value[8..16].try_into().unwrap()),
+            e_tag: value[16..16 + BLOCKID_SIZE].try_into().unwrap(),
+            parts: usize::from_le_bytes(
+                value[16 + BLOCKID_SIZE..16 + BLOCKID_SIZE + PTR_SIZE]
+                    .try_into()
+                    .unwrap(),
+            ),
             blocks,
         })
     }
@@ -444,10 +433,38 @@ struct MultiPart {
     blocks: Vec<BlockID>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 struct BucketMeta {
-    name: String,
     ctime: i64,
+    name: String,
+}
+
+impl From<&BucketMeta> for Vec<u8> {
+    fn from(b: &BucketMeta) -> Self {
+        let mut out = Vec::with_capacity(8 + PTR_SIZE + b.name.len());
+        out.extend_from_slice(&b.ctime.to_le_bytes());
+        out.extend_from_slice(&b.name.len().to_le_bytes());
+        out.extend_from_slice(b.name.as_bytes());
+        out
+    }
+}
+
+impl TryFrom<&[u8]> for BucketMeta {
+    type Error = FsError;
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        if value.len() < 8 + PTR_SIZE {
+            return Err(FsError::MalformedObject);
+        }
+        let name_len = usize::from_le_bytes(value[8..8 + PTR_SIZE].try_into().unwrap());
+        if value.len() != 8 + PTR_SIZE + name_len {
+            return Err(FsError::MalformedObject);
+        }
+        Ok(BucketMeta {
+            ctime: i64::from_le_bytes(value[..8].try_into().unwrap()),
+            // SAFETY: this is safe because we only store valid strings in the first place.
+            name: unsafe { String::from_utf8_unchecked(value[8..].to_vec()) },
+        })
+    }
 }
 
 impl Block {
@@ -697,10 +714,8 @@ impl S3Storage for CasFS {
         let now = Utc::now().timestamp();
         let object = Object {
             size: size as u64,
-            atime: now,
-            mtime: now,
             ctime: now,
-            key: key.clone(),
+            parts: cnt as usize,
             blocks,
             e_tag,
         };
@@ -725,7 +740,7 @@ impl S3Storage for CasFS {
         Ok(CompleteMultipartUploadOutput {
             bucket: Some(bucket),
             key: Some(key),
-            e_tag: Some(format!("\"{}\"", hex_string(&e_tag))),
+            e_tag: Some(object.format_e_tag()),
             ..CompleteMultipartUploadOutput::default()
         })
     }
@@ -756,10 +771,7 @@ impl S3Storage for CasFS {
         };
 
         let now = Utc::now().timestamp();
-        obj_meta.mtime = now;
-        obj_meta.atime = now;
         obj_meta.ctime = now;
-        obj_meta.key = key.to_string();
 
         // TODO: check duplicate?
         let dst_bk = trace_try!(self.bucket(&bucket));
@@ -767,7 +779,7 @@ impl S3Storage for CasFS {
 
         Ok(CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
-                e_tag: Some(format!("\"{}\"", hex_string(&obj_meta.e_tag))),
+                e_tag: Some(obj_meta.format_e_tag()),
                 last_modified: Some(Utc.timestamp(now, 0).to_rfc3339()),
             }),
             ..CopyObjectOutput::default()
@@ -806,11 +818,10 @@ impl S3Storage for CasFS {
         }
         let bucket_meta = trace_try!(self.bucket_meta_tree());
 
-        let bm = serde_json::to_vec(&BucketMeta {
+        let bm = Vec::from(&BucketMeta {
             name: bucket.clone(),
             ctime: Utc::now().timestamp(),
-        })
-        .unwrap();
+        });
 
         trace_try!(bucket_meta.insert(&bucket, bm));
 
@@ -920,6 +931,7 @@ impl S3Storage for CasFS {
         };
         let obj_meta = trace_try!(Object::try_from(&obj.to_vec()[..]));
 
+        let e_tag = obj_meta.format_e_tag();
         let block_map = trace_try!(self.block_tree());
         let mut paths = Vec::with_capacity(obj_meta.blocks.len());
         let mut block_size = 0;
@@ -938,8 +950,8 @@ impl S3Storage for CasFS {
         Ok(GetObjectOutput {
             body: Some(stream),
             content_length: Some(obj_meta.size as i64),
-            last_modified: Some(Utc.timestamp(obj_meta.mtime, 0).to_rfc3339()),
-            e_tag: Some(format!("\"{}\"", hex_string(&obj_meta.e_tag))),
+            last_modified: Some(Utc.timestamp(obj_meta.ctime, 0).to_rfc3339()),
+            e_tag: Some(e_tag),
             ..GetObjectOutput::default()
         })
     }
@@ -971,8 +983,8 @@ impl S3Storage for CasFS {
 
         Ok(HeadObjectOutput {
             content_length: Some(obj_meta.size as i64),
-            last_modified: Some(Utc.timestamp(obj_meta.mtime, 0).to_rfc3339()),
-            e_tag: Some(format!("\"{}\"", hex_string(&obj_meta.e_tag))),
+            last_modified: Some(Utc.timestamp(obj_meta.ctime, 0).to_rfc3339()),
+            e_tag: Some(obj_meta.format_e_tag()),
             ..HeadObjectOutput::default()
         })
     }
@@ -1033,8 +1045,8 @@ impl S3Storage for CasFS {
 
                 S3Object {
                     key: Some(key),
-                    e_tag: Some(format!("\"{}\"", hex_string(&obj.e_tag))),
-                    last_modified: Some(Utc.timestamp(obj.mtime, 0).to_rfc3339()),
+                    e_tag: Some(obj.format_e_tag()),
+                    last_modified: Some(Utc.timestamp(obj.ctime, 0).to_rfc3339()),
                     owner: None,
                     size: Some(obj.size as i64),
                     storage_class: None,
@@ -1092,8 +1104,8 @@ impl S3Storage for CasFS {
 
                 Some(S3Object {
                     key: Some(key),
-                    e_tag: Some(format!("\"{}\"", hex_string(&obj.e_tag))),
-                    last_modified: Some(Utc.timestamp(obj.mtime, 0).to_rfc3339()),
+                    e_tag: Some(obj.format_e_tag()),
+                    last_modified: Some(Utc.timestamp(obj.ctime, 0).to_rfc3339()),
                     owner: None,
                     size: Some(obj.size as i64),
                     storage_class: None,
@@ -1145,22 +1157,19 @@ impl S3Storage for CasFS {
         }
 
         let (blocks, hash, size) = trace_try!(self.store_bytes(body).await);
-        let e_tag = format!("\"{}\"", hex_string(&hash));
         let now = Utc::now().timestamp();
         let obj_meta = Object {
             size,
-            atime: now,
-            mtime: now,
             ctime: now,
             e_tag: hash,
+            parts: 0,
             blocks,
-            key: key.clone(),
         };
 
         trace_try!(trace_try!(self.bucket(&bucket)).insert(&key, Vec::<u8>::from(&obj_meta)));
 
         Ok(PutObjectOutput {
-            e_tag: Some(e_tag),
+            e_tag: Some(obj_meta.format_e_tag()),
             ..PutObjectOutput::default()
         })
     }
