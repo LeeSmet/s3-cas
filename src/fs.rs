@@ -515,8 +515,8 @@ impl TryFrom<&[u8]> for MultiPart {
         };
 
         let block_len = usize::from_le_bytes(
-            value[8 + 4 * PTR_SIZE + bucket_len + key_len + BLOCKID_SIZE
-                ..8 + 5 * PTR_SIZE + bucket_len + key_len + BLOCKID_SIZE]
+            value[8 + 4 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE
+                ..8 + 5 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE]
                 .try_into()
                 .unwrap(),
         );
