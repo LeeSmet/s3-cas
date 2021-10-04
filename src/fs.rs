@@ -580,7 +580,7 @@ impl TryFrom<&[u8]> for BucketMeta {
         Ok(BucketMeta {
             ctime: i64::from_le_bytes(value[..8].try_into().unwrap()),
             // SAFETY: this is safe because we only store valid strings in the first place.
-            name: unsafe { String::from_utf8_unchecked(value[8..].to_vec()) },
+            name: unsafe { String::from_utf8_unchecked(value[8 + PTR_SIZE..].to_vec()) },
         })
     }
 }
