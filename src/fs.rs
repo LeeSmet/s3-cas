@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::prelude::*;
-use faster_hex::hex_string;
+use faster_hex::{hex_decode, hex_string};
 use futures::ready;
 use futures::{
     channel::mpsc::unbounded,
@@ -1201,48 +1201,92 @@ impl S3Storage for CasFS {
             delimiter,
             prefix,
             encoding_type,
+            start_after,
+            max_keys,
+            continuation_token,
             ..
         } = input;
 
         let b = trace_try!(self.bucket(&bucket));
 
-        let objects: Vec<_> = b
-            .scan_prefix(&prefix.as_ref().map(|v| v.as_str()).or(Some("")).unwrap())
-            .filter_map(|read_result| {
-                let (raw_key, raw_value) = match read_result {
-                    Ok((r, k)) => (r, k),
-                    Err(_) => return None,
-                };
+        let key_count = max_keys
+            .and_then(|mk| {
+                if mk > MAX_KEYS {
+                    Some(MAX_KEYS)
+                } else {
+                    Some(mk)
+                }
+            })
+            .unwrap_or(MAX_KEYS);
 
+        let token = if let Some(ref rt) = continuation_token {
+            let mut out = Vec::with_capacity(rt.len() / 2);
+            if let Err(_) = hex_decode(rt.as_bytes(), &mut out) {
+                return Err(
+                    code_error!(InvalidToken, "continuation token has an invalid format").into(),
+                );
+            };
+            match String::from_utf8(out) {
+                Ok(s) => Some(s),
+                Err(_) => {
+                    return Err(code_error!(InvalidToken, "continuation token is invalid").into())
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut objects: Vec<_> = b
+            .scan_prefix(&prefix.as_ref().map(|v| v.as_str()).or(Some("")).unwrap())
+            .filter_map(|read_result| match read_result {
+                Ok((r, k)) => Some((r, k)),
+                Err(_) => None,
+            })
+            .skip_while(|(key, _)| match start_after {
+                None => false,
+                Some(ref start_after) => key <= &sled::IVec::from(start_after.as_bytes()),
+            })
+            .skip_while(|(key, _)| match token {
+                None => false,
+                Some(ref t) => key < &sled::IVec::from(t.as_bytes()),
+            })
+            .map(|(raw_key, raw_value)| {
                 // SAFETY: we only insert valid utf8 strings
                 let key = unsafe { String::from_utf8_unchecked(raw_key.to_vec()) };
                 // unwrap is fine as it would mean either a coding error or a corrupt DB
                 let obj = Object::try_from(&*raw_value).unwrap();
 
-                Some(S3Object {
+                S3Object {
                     key: Some(key),
                     e_tag: Some(obj.format_e_tag()),
                     last_modified: Some(Utc.timestamp(obj.ctime, 0).to_rfc3339()),
                     owner: None,
                     size: Some(obj.size as i64),
                     storage_class: None,
-                })
+                }
             })
+            .take((key_count + 1) as usize)
             .collect();
+
+        let mut next_token = None;
+        let truncated = objects.len() == key_count as usize + 1;
+        if truncated {
+            next_token = Some(hex_string(objects.pop().unwrap().key.unwrap().as_bytes()))
+        }
 
         Ok(ListObjectsV2Output {
             key_count: Some(objects.len() as i64),
             contents: Some(objects),
             common_prefixes: None,
             delimiter,
-            continuation_token: None,
+            continuation_token,
             encoding_type,
-            is_truncated: None,
+            is_truncated: Some(truncated),
             prefix,
             name: Some(bucket),
-            max_keys: None,
-            start_after: None,
-            next_continuation_token: None,
+            max_keys: Some(key_count),
+            start_after,
+            next_continuation_token: next_token,
         })
     }
 

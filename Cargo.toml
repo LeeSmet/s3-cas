@@ -25,7 +25,8 @@ required-features = ["binary"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"], optional = true }
-s3-server = "0.1"
+# s3-server = "0.1"
+s3-server = { git = "https://github.com/LeeSmet/s3-server" }
 sled = "0.34"
 async-trait = "0.1"
 md-5 = { version = "0.9", features = ["asm"] }
