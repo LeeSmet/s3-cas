@@ -1220,7 +1220,7 @@ impl S3Storage for CasFS {
             .unwrap_or(MAX_KEYS);
 
         let token = if let Some(ref rt) = continuation_token {
-            let mut out = Vec::with_capacity(rt.len() / 2);
+            let mut out = vec![0; rt.len() / 2];
             if let Err(_) = hex_decode(rt.as_bytes(), &mut out) {
                 return Err(
                     code_error!(InvalidToken, "continuation token has an invalid format").into(),
