@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use chrono::prelude::*;
 use faster_hex::{hex_decode, hex_string};
-use futures::ready;
 use futures::{
     channel::mpsc::unbounded,
     sink::SinkExt,
@@ -9,6 +8,7 @@ use futures::{
     stream::{StreamExt, TryStreamExt},
     AsyncRead, Future, Stream,
 };
+use futures::{ready, AsyncSeek};
 use hyper::body::Bytes;
 use md5::{Digest, Md5};
 use s3_server::dto::{
@@ -602,21 +602,27 @@ impl Block {
 
 /// Implementation of a single stream over potentially multiple on disk data block files.
 struct BlockStream {
-    paths: Vec<PathBuf>,
-    fp: usize,                    // pointer to current file path
-    file: Option<async_fs::File>, // current file to read
+    paths: Vec<(PathBuf, usize)>,
+    fp: usize, // pointer to current file path
     size: usize,
+    processed: usize,
+    has_seeked: bool,
+    range: RangeRequest,
+    file: Option<async_fs::File>, // current file to read
     open_fut: Option<Pin<Box<dyn Future<Output = io::Result<async_fs::File>> + Send>>>,
 }
 
 impl BlockStream {
-    fn new(paths: Vec<PathBuf>, size: usize) -> Self {
+    fn new(paths: Vec<(PathBuf, usize)>, size: usize, range: RangeRequest) -> Self {
         Self {
             paths,
             fp: 0,
             file: None,
             size,
+            has_seeked: true,
+            processed: 0,
             open_fut: None,
+            range,
         }
     }
 }
@@ -625,9 +631,64 @@ impl Stream for BlockStream {
     type Item = io::Result<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let (start, end) = match self.range {
+            RangeRequest::Range(start, end) => (start, end),
+            RangeRequest::ToBytes(end) => (0, end),
+            RangeRequest::FromBytes(start) => (
+                start,
+                self.paths[if self.file.is_some() || self.open_fut.is_some() {
+                    self.fp - 1
+                } else {
+                    self.fp
+                }]
+                .1 as u64,
+            ),
+            RangeRequest::All => (
+                0,
+                self.paths[if self.file.is_some() || self.open_fut.is_some() {
+                    self.fp - 1
+                } else {
+                    self.fp
+                }]
+                .1 as u64,
+            ),
+        };
+        let processed = self.processed as u64;
+
+        if processed > end {
+            // we did all we need here, exit. This is here because we can't both return data in the
+            // actual read, and indicate the stream is done
+            return Poll::Ready(None);
+        }
+
+        // try to seek in the file to the correct offset
+        // since we skip files we don't need to read from, this file always has at least _some_
+        // bytes to read, and hence seek is always within bounds (even though it is technically not
+        // an error if it isn't).
+        if !self.has_seeked && start > processed {
+            if let Some(ref mut file) = self.file {
+                return match Pin::new(file)
+                    .poll_seek(cx, io::SeekFrom::Current((start - processed) as i64))
+                {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+                    Poll::Ready(Ok(_)) => {
+                        self.has_seeked = true;
+                        // TODO: this can be `n`
+                        self.processed += (start - processed) as usize;
+                        self.poll_next(cx)
+                    }
+                };
+            }
+        }
+
         // if we have an open file, try to read it
         if let Some(ref mut file) = self.file {
-            let mut buf = vec![0; 4096];
+            let mut cap = end - processed + 1;
+            if cap > 4096 {
+                cap = 4096;
+            }
+            let mut buf = vec![0; cap as usize];
             return match Pin::new(file).poll_read(cx, &mut buf) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
@@ -636,10 +697,63 @@ impl Stream for BlockStream {
                     self.poll_next(cx)
                 }
                 Poll::Ready(Ok(n)) => {
+                    self.processed += n;
                     buf.truncate(n);
                     Poll::Ready(Some(Ok(buf.into())))
                 }
             };
+        }
+
+        // check if we even need bytes from the next files
+        // make sure to only do this when we are not already polling. The issue is that opening a
+        // file advanced fp even before the file is opened, which might cause an issue in the
+        // calculation of a range request, if the new file is so small that it would be skipped.
+        if self.open_fut.is_none() {
+            loop {
+                // TODO: Fix this crap
+                let processed = self.processed as u64;
+                match self.range {
+                    RangeRequest::Range(start, end) => {
+                        if processed > end {
+                            return Poll::Ready(None);
+                        } else if processed < start {
+                            if processed + (self.paths[self.fp].1 as u64) < start {
+                                // skip file entirely
+                                self.processed += self.paths[self.fp].1;
+                                self.fp += 1;
+                                if self.fp > self.paths.len() {
+                                    return Poll::Ready(None);
+                                }
+                                continue;
+                            }
+                            break;
+                        } else {
+                            break;
+                        }
+                    }
+                    RangeRequest::ToBytes(end) => {
+                        if processed > end {
+                            return Poll::Ready(None);
+                        }
+                        break;
+                    }
+                    RangeRequest::FromBytes(start) => {
+                        if processed < start {
+                            if processed + (self.paths[self.fp].1 as u64) < start {
+                                // skip file entirely
+                                self.processed += self.paths[self.fp].1;
+                                self.fp += 1;
+                                if self.fp > self.paths.len() {
+                                    return Poll::Ready(None);
+                                }
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    RangeRequest::All => break,
+                }
+            }
         }
 
         // we don't have an open file, check if we have any more left
@@ -650,7 +764,9 @@ impl Stream for BlockStream {
         // try to open the next file
         // if we are not opening one already start doing so
         if self.open_fut.is_none() {
-            self.open_fut = Some(Box::pin(async_fs::File::open(self.paths[self.fp].clone())));
+            self.open_fut = Some(Box::pin(async_fs::File::open(
+                self.paths[self.fp].0.clone(),
+            )));
             // increment the file pointer for the next file
             self.fp += 1;
         };
@@ -669,6 +785,7 @@ impl Stream for BlockStream {
                 // and read from it
                 Ok(file) => {
                     self.file = Some(file);
+                    self.has_seeked = false;
                     return self.poll_next(cx);
                 }
             };
@@ -757,6 +874,112 @@ impl Stream for BufferedByteStream {
                 }
             };
         }
+    }
+}
+
+/// Requested bytes from a file.
+#[derive(Debug)]
+enum RangeRequest {
+    /// All bytes, i.e. full file.
+    All,
+    /// A range of bytes from the file. The range is inclusive.
+    Range(u64, u64),
+    /// All bytes until the given position. This is equivalent to Range(0, value).
+    ToBytes(u64),
+    /// All bytes from a given position until the end of the file. This is equivalent to
+    /// Range(value, EOF).
+    FromBytes(u64),
+}
+
+impl RangeRequest {
+    fn size(&self, file_size: u64) -> u64 {
+        let (start, end) = match self {
+            RangeRequest::All => (0, file_size - 1),
+            RangeRequest::ToBytes(end) => (0, *end),
+            RangeRequest::FromBytes(start) => (*start, file_size - 1),
+            RangeRequest::Range(start, end) => (*start, *end),
+        };
+        return end - start + 1;
+    }
+}
+
+// TODO: replace with a parse impl on RangeRequest
+/// Parse a range request.
+fn parse_range_request(input: &Option<String>) -> RangeRequest {
+    if let Some(ref input) = input {
+        if !input.starts_with("bytes=") {
+            eprintln!("Invalid range input \"{}\"", input);
+            return RangeRequest::All;
+        }
+        let (_, input) = input.split_at(6); // split of "bytes="
+        let mut parts = input.split('-');
+        let first = parts.next();
+        let second = parts.next();
+        if first.is_none() || second.is_none() {
+            eprintln!("invalid range request structure {}", input);
+            return RangeRequest::All;
+        }
+        let first = first.unwrap();
+        let second = second.unwrap();
+        if parts.next().is_some() {
+            eprintln!("invalid range request structure {}", input);
+            return RangeRequest::All;
+        }
+        if first == "" && second == "" {
+            eprintln!("invalid range request - missing start AND end {}", input);
+            return RangeRequest::All;
+        }
+        if first == "" {
+            match second.parse() {
+                Ok(end) => RangeRequest::ToBytes(end),
+                Err(e) => {
+                    eprintln!(
+                        "invalid range request - could not parse end ({}): {}",
+                        e, input
+                    );
+                    RangeRequest::All
+                }
+            }
+        } else if second == "" {
+            match first.parse() {
+                Ok(start) => RangeRequest::FromBytes(start),
+                Err(e) => {
+                    eprintln!(
+                        "invalid range request - could not parse start ({}): {}",
+                        e, input
+                    );
+                    RangeRequest::All
+                }
+            }
+        } else {
+            let start = match first.parse() {
+                Ok(start) => start,
+                Err(e) => {
+                    eprintln!(
+                        "invalid range request - could not parse start from string ({}): {}",
+                        e, input
+                    );
+                    return RangeRequest::All;
+                }
+            };
+            let end = match second.parse() {
+                Ok(end) => end,
+                Err(e) => {
+                    eprintln!(
+                        "invalid range request - could not parse end from string ({}): {}",
+                        e, input
+                    );
+                    return RangeRequest::All;
+                }
+            };
+            if end < start {
+                eprintln!("invalid range request - start bigger than end",);
+                return RangeRequest::All;
+            }
+            RangeRequest::Range(start, end)
+        }
+    } else {
+        RangeRequest::All
     }
 }
 
@@ -1039,7 +1262,11 @@ impl S3Storage for CasFS {
         &self,
         input: GetObjectRequest,
     ) -> S3StorageResult<GetObjectOutput, s3_server::dto::GetObjectError> {
-        let GetObjectRequest { bucket, key, .. } = input;
+        let GetObjectRequest {
+            bucket, key, range, ..
+        } = input;
+
+        let range = parse_range_request(&range);
 
         let bk = trace_try!(self.bucket(&bucket));
         let obj = match trace_try!(bk.get(&key)) {
@@ -1047,6 +1274,7 @@ impl S3Storage for CasFS {
             Some(obj) => obj,
         };
         let obj_meta = trace_try!(Object::try_from(&obj.to_vec()[..]));
+        let stream_size = range.size(obj_meta.size);
 
         let e_tag = obj_meta.format_e_tag();
         let block_map = trace_try!(self.block_tree());
@@ -1058,15 +1286,16 @@ impl S3Storage for CasFS {
             let block_meta_enc = trace_try!(block_map.get(block)).unwrap();
             let block_meta = trace_try!(Block::try_from(&*block_meta_enc));
             block_size += block_meta.size;
-            paths.push(block_meta.disk_path(self.root.clone()));
+            paths.push((block_meta.disk_path(self.root.clone()), block_meta.size));
         }
         debug_assert!(obj_meta.size as usize == block_size);
-        let block_stream = BlockStream::new(paths, block_size);
+        let block_stream = BlockStream::new(paths, block_size, range);
 
-        let stream = ByteStream::new_with_size(block_stream, obj_meta.size as usize);
+        // TODO: part count
+        let stream = ByteStream::new_with_size(block_stream, stream_size as usize);
         Ok(GetObjectOutput {
             body: Some(stream),
-            content_length: Some(obj_meta.size as i64),
+            content_length: Some(stream_size as i64),
             last_modified: Some(Utc.timestamp(obj_meta.ctime, 0).to_rfc3339()),
             e_tag: Some(e_tag),
             ..GetObjectOutput::default()
