@@ -16,26 +16,21 @@ use s3_server::dto::{
     DeleteObjectOutput, DeleteObjectRequest, DeleteObjectsOutput, DeleteObjectsRequest,
     DeletedObject, PutObjectOutput, PutObjectRequest,
 };
+use s3_server::dto::{UploadPartOutput, UploadPartRequest};
 use s3_server::headers::AmzCopySource;
 use s3_server::{
     dto::{
-        Bucket, ByteStream, CompleteMultipartUploadError, CompleteMultipartUploadOutput,
-        CompleteMultipartUploadRequest, CreateBucketOutput, CreateBucketRequest,
-        CreateMultipartUploadOutput, CreateMultipartUploadRequest, GetBucketLocationOutput,
-        GetBucketLocationRequest, GetObjectOutput, GetObjectRequest, HeadBucketOutput,
-        HeadBucketRequest, HeadObjectOutput, HeadObjectRequest, ListBucketsOutput,
-        ListBucketsRequest, ListObjectsOutput, ListObjectsRequest, ListObjectsV2Output,
-        ListObjectsV2Request, Object as S3Object,
+        Bucket, ByteStream, CompleteMultipartUploadOutput, CompleteMultipartUploadRequest,
+        CreateBucketOutput, CreateBucketRequest, CreateMultipartUploadOutput,
+        CreateMultipartUploadRequest, GetBucketLocationOutput, GetBucketLocationRequest,
+        GetObjectOutput, GetObjectRequest, HeadBucketOutput, HeadBucketRequest, HeadObjectOutput,
+        HeadObjectRequest, ListBucketsOutput, ListBucketsRequest, ListObjectsOutput,
+        ListObjectsRequest, ListObjectsV2Output, ListObjectsV2Request, Object as S3Object,
     },
     errors::S3StorageResult,
-    path::S3Path,
     S3Storage,
 };
-use s3_server::{
-    dto::{UploadPartOutput, UploadPartRequest},
-    errors::S3StorageError,
-};
-use sled::{Db, IVec, Transactional};
+use sled::{Db, Transactional};
 use std::{
     convert::{TryFrom, TryInto},
     fmt::{self, Display, Formatter},
