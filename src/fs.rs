@@ -106,6 +106,86 @@ impl CasFS {
         Ok(())
     }
 
+    /// Delete an object from a bucket.
+    async fn delete_object(&self, bucket: &str, object: &str) -> Result<(), sled::Error> {
+        #[cfg(not(refcount))]
+        {
+            self.bucket(bucket)?.remove(object).map(|_| ())
+        }
+        #[cfg(refcount)]
+        {
+            // Remove an object. This fetches the object, decrements the refcount of all blocks,
+            // and removes blocks which are no longer referenced.
+            let block_map = self.block_tree()?;
+            let path_map = self.path_tree()?;
+            let bucket = self.bucket(bucket)?;
+            let blocks_to_delete = match (&bucket, &block_map).transaction(|(bucket, blocks)| {
+                match bucket.get(object)? {
+                    None => Ok(vec![]),
+                    Some(o) => {
+                        let obj = Object::try_from(&*o).expect("Malformed object");
+                        let mut to_delete = Vec::with_capacity(obj.blocks.len());
+                        // delete the object in the database, we have it in memory to remove the
+                        // blocks as needed.
+                        bucket.remove(object)?;
+                        for block_id in obj.blocks {
+                            match blocks.get(block_id)? {
+                                // This is technically impossible
+                                None => eprintln!(
+                                    "missing block {} in block map",
+                                    hex_string(&block_id)
+                                ),
+                                Some(block_data) => {
+                                    let mut block =
+                                        Block::try_from(&*block_data).expect("corrupt block data");
+                                    // We are deleting the last reference to the block, delete the
+                                    // whole block.
+                                    // Importantly, we don't remove the path yet from the path map.
+                                    // Leaving this path dangling in the database ensures it is not
+                                    // filled in by another block, before we properly delete the
+                                    // path from disk.
+                                    if block.rc == 1 {
+                                        blocks.remove(&block_id)?;
+                                        to_delete.push(block);
+                                    } else {
+                                        block.rc -= 1;
+                                        blocks.insert(&block_id, Vec::from(&block))?;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(to_delete)
+                    }
+                }
+            }) {
+                Err(sled::transaction::TransactionError::Storage(e)) => {
+                    return Err(e);
+                }
+                Ok(blocks) => blocks,
+                // We don't abort manually so this can't happen
+                Err(sled::transaction::TransactionError::Abort(_)) => unreachable!(),
+            };
+
+            // Now delete all the blocks from disk, and unlink them in the path map.
+            for block in blocks_to_delete {
+                async_fs::remove_file(block.disk_path(self.root.clone()))
+                    .await
+                    .expect("Could not delete file");
+                // Now that the path is free it can be removed from the path map
+                if let Err(e) = path_map.remove(&block.path) {
+                    // Only print error, we might be able to remove the other ones. If we exist
+                    // here, those will be left dangling.
+                    eprintln!(
+                        "Could not unlink path {} from path map",
+                        hex_string(&block.path)
+                    );
+                };
+            }
+
+            Ok(())
+        }
+    }
+
     /// Get a list of all buckets in the system.
     fn buckets(&self) -> Result<Vec<Bucket>, sled::Error> {
         Ok(self
@@ -452,6 +532,21 @@ impl TryFrom<&[u8]> for Block {
     }
 }
 
+impl Block {
+    fn disk_path(&self, mut root: PathBuf) -> PathBuf {
+        // path has at least len 1
+        let dirs = &self.path[..self.path.len() - 1];
+        for byte in dirs {
+            root.push(hex_string(&[*byte]));
+        }
+        root.push(format!(
+            "_{}",
+            hex_string(&[self.path[self.path.len() - 1]])
+        ));
+        root
+    }
+}
+
 #[derive(Debug)]
 struct MultiPart {
     size: usize,
@@ -613,21 +708,6 @@ impl TryFrom<&[u8]> for BucketMeta {
             // SAFETY: this is safe because we only store valid strings in the first place.
             name: unsafe { String::from_utf8_unchecked(value[8 + PTR_SIZE..].to_vec()) },
         })
-    }
-}
-
-impl Block {
-    fn disk_path(&self, mut root: PathBuf) -> PathBuf {
-        // path has at least len 1
-        let dirs = &self.path[..self.path.len() - 1];
-        for byte in dirs {
-            root.push(hex_string(&[*byte]));
-        }
-        root.push(format!(
-            "_{}",
-            hex_string(&[self.path[self.path.len() - 1]])
-        ));
-        root
     }
 }
 
@@ -1222,7 +1302,7 @@ impl S3Storage for CasFS {
             return Err(code_error!(NoSuchBucket, "Bucket does not exist").into());
         }
 
-        trace_try!(trace_try!(self.bucket(&bucket)).remove(&key));
+        trace_try!(self.delete_object(&bucket, &key).await);
 
         Ok(DeleteObjectOutput::default())
     }
@@ -1237,13 +1317,12 @@ impl S3Storage for CasFS {
         if !trace_try!(self.bucket_exists(&input.bucket)) {
             return Err(code_error!(NoSuchBucket, "Bucket does not exist").into());
         }
-        let bucket = trace_try!(self.bucket(&input.bucket));
 
         let mut deleted = Vec::with_capacity(input.delete.objects.len());
         let mut errors = Vec::new();
 
         for object in input.delete.objects {
-            match bucket.remove(&object.key) {
+            match self.delete_object(&input.bucket, &object.key).await {
                 Ok(_) => {
                     deleted.push(DeletedObject {
                         key: Some(object.key),
