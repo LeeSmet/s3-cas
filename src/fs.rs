@@ -119,45 +119,48 @@ impl CasFS {
             let block_map = self.block_tree()?;
             let path_map = self.path_tree()?;
             let bucket = self.bucket(bucket)?;
-            let blocks_to_delete = match (&bucket, &block_map).transaction(|(bucket, blocks)| {
-                match bucket.get(object)? {
-                    None => Ok(vec![]),
-                    Some(o) => {
-                        let obj = Object::try_from(&*o).expect("Malformed object");
-                        let mut to_delete = Vec::with_capacity(obj.blocks.len());
-                        // delete the object in the database, we have it in memory to remove the
-                        // blocks as needed.
-                        bucket.remove(object)?;
-                        for block_id in obj.blocks {
-                            match blocks.get(block_id)? {
-                                // This is technically impossible
-                                None => eprintln!(
-                                    "missing block {} in block map",
-                                    hex_string(&block_id)
-                                ),
-                                Some(block_data) => {
-                                    let mut block =
-                                        Block::try_from(&*block_data).expect("corrupt block data");
-                                    // We are deleting the last reference to the block, delete the
-                                    // whole block.
-                                    // Importantly, we don't remove the path yet from the path map.
-                                    // Leaving this path dangling in the database ensures it is not
-                                    // filled in by another block, before we properly delete the
-                                    // path from disk.
-                                    if block.rc == 1 {
-                                        blocks.remove(&block_id)?;
-                                        to_delete.push(block);
-                                    } else {
-                                        block.rc -= 1;
-                                        blocks.insert(&block_id, Vec::from(&block))?;
+            let blocks_to_delete_res: Result<Vec<Block>, sled::transaction::TransactionError> =
+                (&bucket, &block_map).transaction(|(bucket, blocks)| {
+                    match bucket.get(object)? {
+                        None => Ok(vec![]),
+                        Some(o) => {
+                            let obj = Object::try_from(&*o).expect("Malformed object");
+                            let mut to_delete = Vec::with_capacity(obj.blocks.len());
+                            // delete the object in the database, we have it in memory to remove the
+                            // blocks as needed.
+                            bucket.remove(object)?;
+                            for block_id in obj.blocks {
+                                match blocks.get(block_id)? {
+                                    // This is technically impossible
+                                    None => eprintln!(
+                                        "missing block {} in block map",
+                                        hex_string(&block_id)
+                                    ),
+                                    Some(block_data) => {
+                                        let mut block = Block::try_from(&*block_data)
+                                            .expect("corrupt block data");
+                                        // We are deleting the last reference to the block, delete the
+                                        // whole block.
+                                        // Importantly, we don't remove the path yet from the path map.
+                                        // Leaving this path dangling in the database ensures it is not
+                                        // filled in by another block, before we properly delete the
+                                        // path from disk.
+                                        if block.rc == 1 {
+                                            blocks.remove(&block_id)?;
+                                            to_delete.push(block);
+                                        } else {
+                                            block.rc -= 1;
+                                            blocks.insert(&block_id, Vec::from(&block))?;
+                                        }
                                     }
                                 }
                             }
+                            Ok(to_delete)
                         }
-                        Ok(to_delete)
                     }
-                }
-            }) {
+                });
+
+            let blocks_to_delete = match blocks_to_delete_res {
                 Err(sled::transaction::TransactionError::Storage(e)) => {
                     return Err(e);
                 }
@@ -264,7 +267,7 @@ impl CasFS {
                                     block.rc += 1;
                                     // write block back
                                     // TODO: this could be done in an `update_and_fetch`
-                                    blocks.insert(block_hash, Vec::from(block))?;
+                                    blocks.insert(&block_hash, Vec::from(&block))?;
                                 }
 
                                 return Ok(false);
@@ -528,7 +531,7 @@ impl TryFrom<&[u8]> for Block {
             size,
             path,
             #[cfg(feature = "refcount")]
-            rc: usize::from_le_bytes(value[PTR_SIZE + 1 + vec_size..]),
+            rc: usize::from_le_bytes(value[PTR_SIZE + 1 + vec_size..].try_into().unwrap()),
         })
     }
 }
