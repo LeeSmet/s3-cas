@@ -108,11 +108,11 @@ impl CasFS {
 
     /// Delete an object from a bucket.
     async fn delete_object(&self, bucket: &str, object: &str) -> Result<(), sled::Error> {
-        #[cfg(not(refcount))]
+        #[cfg(not(feature = "refcount"))]
         {
             self.bucket(bucket)?.remove(object).map(|_| ())
         }
-        #[cfg(refcount)]
+        #[cfg(feature = "refcount")]
         {
             // Remove an object. This fetches the object, decrements the refcount of all blocks,
             // and removes blocks which are no longer referenced.
@@ -253,9 +253,10 @@ impl CasFS {
                 let should_write: Result<bool, sled::transaction::TransactionError> =
                     (&block_map, &path_map).transaction(|(blocks, paths)| {
                         match blocks.get(block_hash)? {
+                            #[allow(unused_variables)] // Don't warn here if we don't use refcount.
                             Some(block_data) => {
                                 // Block already exists
-                                #[cfg(refcount)]
+                                #[cfg(feature = "refcount")]
                                 {
                                     // bump refcount on the block
                                     let mut block = Block::try_from(&*block_data)
@@ -282,7 +283,7 @@ impl CasFS {
                                     let block = Block {
                                         size: data_len,
                                         path: block_hash[..index].to_vec(),
-                                        #[cfg(refcount)]
+                                        #[cfg(feature = "refcount")]
                                         rc: 1,
                                     };
 
@@ -475,7 +476,7 @@ impl TryFrom<&[u8]> for Object {
 struct Block {
     size: usize,
     path: Vec<u8>,
-    #[cfg(refcount)]
+    #[cfg(feature = "refcount")]
     rc: usize,
 }
 
@@ -483,15 +484,15 @@ impl From<&Block> for Vec<u8> {
     fn from(b: &Block) -> Self {
         // NOTE: we encode the lenght of the vector as a single byte, since it can only be 16 bytes
         // long.
-        #[cfg(not(refcount))]
+        #[cfg(not(feature = "refcount"))]
         let mut out = Vec::with_capacity(PTR_SIZE + b.path.len() + 1);
-        #[cfg(refcount)]
+        #[cfg(feature = "refcount")]
         let mut out = Vec::with_capacity(2 * PTR_SIZE + b.path.len() + 1);
 
         out.extend_from_slice(&b.size.to_le_bytes());
         out.extend_from_slice(&(b.path.len() as u8).to_le_bytes());
         out.extend_from_slice(&b.path);
-        #[cfg(refcount)]
+        #[cfg(feature = "refcount")]
         out.extend_from_slice(&b.rc.to_le_bytes());
         out
     }
@@ -513,12 +514,12 @@ impl TryFrom<&[u8]> for Block {
         }
         let path = value[PTR_SIZE + 1..PTR_SIZE + 1 + vec_size].to_vec();
 
-        #[cfg(not(refcount))]
+        #[cfg(not(feature = "refcount"))]
         if value.len() != PTR_SIZE + 1 + vec_size {
             return Err(FsError::MalformedObject);
         }
 
-        #[cfg(refcount)]
+        #[cfg(feature = "refcount")]
         if value.len() != PTR_SIZE * 2 + 1 + vec_size {
             return Err(FsError::MalformedObject);
         }
@@ -526,7 +527,7 @@ impl TryFrom<&[u8]> for Block {
         Ok(Block {
             size,
             path,
-            #[cfg(refcount)]
+            #[cfg(feature = "refcount")]
             rc: usize::from_le_bytes(value[PTR_SIZE + 1 + vec_size..]),
         })
     }
