@@ -172,35 +172,49 @@ impl CasFS {
                 // insert it.
                 let should_write: Result<bool, sled::transaction::TransactionError> =
                     (&block_map, &path_map).transaction(|(blocks, paths)| {
-                        let bid = blocks.get(block_hash)?;
-                        if bid.is_some() {
-                            // block already exists, since we did not write we can return here
-                            // without error
-                            return Ok(false);
+                        match blocks.get(block_hash)? {
+                            Some(block_data) => {
+                                // Block already exists
+                                #[cfg(refcount)]
+                                {
+                                    // bump refcount on the block
+                                    let mut block = Block::try_from(&*block_data)
+                                        .expect("Only valid blocks are stored");
+                                    block.rc += 1;
+                                    // write block back
+                                    // TODO: this could be done in an `update_and_fetch`
+                                    blocks.insert(block_hash, Vec::from(block))?;
+                                }
+
+                                return Ok(false);
+                            }
+                            None => {
+                                // find a free path
+                                for index in 1..BLOCKID_SIZE {
+                                    if paths.get(&block_hash[..index])?.is_some() {
+                                        // path already used, try the next one
+                                        continue;
+                                    };
+
+                                    // path is free, insert
+                                    paths.insert(&block_hash[..index], &block_hash)?;
+
+                                    let block = Block {
+                                        size: data_len,
+                                        path: block_hash[..index].to_vec(),
+                                        #[cfg(refcount)]
+                                        rc: 1,
+                                    };
+
+                                    blocks.insert(&block_hash, Vec::from(&block))?;
+                                    return Ok(true);
+                                }
+
+                                // The loop above can only NOT find a path in case it is duplicate
+                                // block, wich already breaks out at the start.
+                                unreachable!();
+                            }
                         }
-
-                        // find a free path
-                        for index in 1..BLOCKID_SIZE {
-                            if paths.get(&block_hash[..index])?.is_some() {
-                                // path already used, try the next one
-                                continue;
-                            };
-
-                            // path is free, insert
-                            paths.insert(&block_hash[..index], &block_hash)?;
-
-                            let block = Block {
-                                size: data_len,
-                                path: block_hash[..index].to_vec(),
-                            };
-
-                            blocks.insert(&block_hash, Vec::from(&block))?;
-                            return Ok(true);
-                        }
-
-                        // The loop above can only NOT find a path in case it is duplicate
-                        // block, wich already breaks out at the start.
-                        unreachable!();
                     });
 
                 match should_write {
