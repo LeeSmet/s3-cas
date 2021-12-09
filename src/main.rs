@@ -17,6 +17,9 @@ struct Args {
     #[structopt(long, default_value = ".")]
     fs_root: PathBuf,
 
+    #[structopt(long, default_value = ".")]
+    meta_root: PathBuf,
+
     #[structopt(long, default_value = "localhost")]
     host: String,
 
@@ -54,7 +57,7 @@ async fn main() -> Result<()> {
 
     // setup the storage
     // let fs = FileSystem::new(&args.fs_root)?;
-    let fs = CasFS::new(args.fs_root);
+    let fs = CasFS::new(args.fs_root, args.meta_root);
     // debug!(?fs);
 
     // setup the service

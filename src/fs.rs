@@ -58,12 +58,11 @@ pub struct CasFS {
 }
 
 impl CasFS {
-    pub fn new(mut root: PathBuf) -> Self {
-        let mut db_path = root.clone();
-        db_path.push("db");
+    pub fn new(mut root: PathBuf, mut meta_path: PathBuf) -> Self {
+        meta_path.push("db");
         root.push("blocks");
         Self {
-            db: sled::open(db_path).unwrap(),
+            db: sled::open(meta_path).unwrap(),
             root,
         }
     }
