@@ -98,10 +98,22 @@ impl CasFS {
     }
 
     /// Remove a bucket and its associated metadata.
-    fn bucket_delete(&self, bucket: &str) -> Result<(), sled::Error> {
+    // TODO: this is very much not optimal
+    async fn bucket_delete(&self, bucket_name: &str) -> Result<(), sled::Error> {
         let bmt = self.bucket_meta_tree()?;
-        bmt.remove(bucket)?;
-        self.db.drop_tree(bucket)?;
+        bmt.remove(bucket_name)?;
+        #[cfg(feature = "refcount")]
+        {
+            let bucket = self.bucket(bucket_name)?;
+            for key in bucket.iter().keys() {
+                self.delete_object(
+                    bucket_name,
+                    std::str::from_utf8(&*key?).expect("keys are valid utf-8"),
+                )
+                .await?;
+            }
+        }
+        self.db.drop_tree(bucket_name)?;
         Ok(())
     }
 
@@ -1290,7 +1302,7 @@ impl S3Storage for CasFS {
     ) -> S3StorageResult<DeleteBucketOutput, s3_server::dto::DeleteBucketError> {
         let DeleteBucketRequest { bucket, .. } = input;
 
-        trace_try!(self.bucket_delete(&bucket));
+        trace_try!(self.bucket_delete(&bucket).await);
 
         Ok(DeleteBucketOutput)
     }
