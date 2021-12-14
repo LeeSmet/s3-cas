@@ -1,4 +1,4 @@
-use s3_cas::{fs::CasFS, passthrough::Passthrough};
+use s3_cas::{cas::CasFS, passthrough::Passthrough};
 use s3_server::S3Service;
 use s3_server::SimpleAuth;
 

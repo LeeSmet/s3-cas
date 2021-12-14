@@ -1,23 +1,28 @@
+use super::{
+    block::{Block, BlockID, BLOCKID_SIZE},
+    block_stream::BlockStream,
+    errors::FsError,
+    multipart::MultiPart,
+    object::Object,
+    range_request::parse_range_request,
+};
 use async_trait::async_trait;
 use chrono::prelude::*;
 use faster_hex::{hex_decode, hex_string};
 use futures::{
     channel::mpsc::unbounded,
+    ready,
     sink::SinkExt,
     stream,
     stream::{StreamExt, TryStreamExt},
-    AsyncRead, Future, Stream,
+    Stream,
 };
-use futures::{ready, AsyncSeek};
-use hyper::body::Bytes;
 use md5::{Digest, Md5};
 use s3_server::dto::{
     CopyObjectOutput, CopyObjectRequest, CopyObjectResult, DeleteBucketOutput, DeleteBucketRequest,
     DeleteObjectOutput, DeleteObjectRequest, DeleteObjectsOutput, DeleteObjectsRequest,
     DeletedObject, PutObjectOutput, PutObjectRequest,
 };
-use s3_server::dto::{UploadPartOutput, UploadPartRequest};
-use s3_server::headers::AmzCopySource;
 use s3_server::{
     dto::{
         Bucket, ByteStream, CompleteMultipartUploadOutput, CompleteMultipartUploadRequest,
@@ -26,14 +31,15 @@ use s3_server::{
         GetObjectOutput, GetObjectRequest, HeadBucketOutput, HeadBucketRequest, HeadObjectOutput,
         HeadObjectRequest, ListBucketsOutput, ListBucketsRequest, ListObjectsOutput,
         ListObjectsRequest, ListObjectsV2Output, ListObjectsV2Request, Object as S3Object,
+        UploadPartOutput, UploadPartRequest,
     },
     errors::S3StorageResult,
+    headers::AmzCopySource,
     S3Storage,
 };
 use sled::{Db, Transactional};
 use std::{
     convert::{TryFrom, TryInto},
-    fmt::{self, Display, Formatter},
     io, mem,
     path::PathBuf,
     pin::Pin,
@@ -46,11 +52,8 @@ const BUCKET_META_TREE: &str = "_BUCKETS";
 const BLOCK_TREE: &str = "_BLOCKS";
 const PATH_TREE: &str = "_PATHS";
 const MULTIPART_TREE: &str = "_MULTIPART_PARTS";
-const BLOCKID_SIZE: usize = 16;
-const PTR_SIZE: usize = mem::size_of::<usize>(); // Size of a `usize` in bytes
+pub const PTR_SIZE: usize = mem::size_of::<usize>(); // Size of a `usize` in bytes
 const MAX_KEYS: i64 = 1000;
-
-type BlockID = [u8; BLOCKID_SIZE]; // Size of an md5 hash
 
 pub struct CasFS {
     db: Db,
@@ -136,16 +139,16 @@ impl CasFS {
                         None => Ok(vec![]),
                         Some(o) => {
                             let obj = Object::try_from(&*o).expect("Malformed object");
-                            let mut to_delete = Vec::with_capacity(obj.blocks.len());
+                            let mut to_delete = Vec::with_capacity(obj.blocks().len());
                             // delete the object in the database, we have it in memory to remove the
                             // blocks as needed.
                             bucket.remove(object)?;
-                            for block_id in obj.blocks {
+                            for block_id in obj.blocks() {
                                 match blocks.get(block_id)? {
                                     // This is technically impossible
                                     None => eprintln!(
                                         "missing block {} in block map",
-                                        hex_string(&block_id)
+                                        hex_string(&*block_id)
                                     ),
                                     Some(block_data) => {
                                         let mut block = Block::try_from(&*block_data)
@@ -156,12 +159,12 @@ impl CasFS {
                                         // Leaving this path dangling in the database ensures it is not
                                         // filled in by another block, before we properly delete the
                                         // path from disk.
-                                        if block.rc == 1 {
-                                            blocks.remove(&block_id)?;
+                                        if block.rc() == 1 {
+                                            blocks.remove(&*block_id)?;
                                             to_delete.push(block);
                                         } else {
-                                            block.rc -= 1;
-                                            blocks.insert(&block_id, Vec::from(&block))?;
+                                            block.decrement_refcount();
+                                            blocks.insert(&*block_id, Vec::from(&block))?;
                                         }
                                     }
                                 }
@@ -186,12 +189,12 @@ impl CasFS {
                     .await
                     .expect("Could not delete file");
                 // Now that the path is free it can be removed from the path map
-                if let Err(e) = path_map.remove(&block.path) {
+                if let Err(e) = path_map.remove(block.path()) {
                     // Only print error, we might be able to remove the other ones. If we exist
                     // here, those will be left dangling.
                     eprintln!(
                         "Could not unlink path {} from path map",
-                        hex_string(&block.path)
+                        hex_string(block.path())
                     );
                 };
             }
@@ -275,7 +278,7 @@ impl CasFS {
                                     // bump refcount on the block
                                     let mut block = Block::try_from(&*block_data)
                                         .expect("Only valid blocks are stored");
-                                    block.rc += 1;
+                                    block.increment_refcount();
                                     // write block back
                                     // TODO: this could be done in an `update_and_fetch`
                                     blocks.insert(&block_hash, Vec::from(&block))?;
@@ -294,12 +297,7 @@ impl CasFS {
                                     // path is free, insert
                                     paths.insert(&block_hash[..index], &block_hash)?;
 
-                                    let block = Block {
-                                        size: data_len,
-                                        path: block_hash[..index].to_vec(),
-                                        #[cfg(feature = "refcount")]
-                                        rc: 1,
-                                    };
+                                    let block = Block::new(data_len, block_hash[..index].to_vec());
 
                                     blocks.insert(&block_hash, Vec::from(&block))?;
                                     return Ok(true);
@@ -373,325 +371,6 @@ impl CasFS {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum FsError {
-    Db(sled::Error),
-    MalformedObject,
-}
-
-impl Display for FsError {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(
-            f,
-            "Cas FS error: {}",
-            match self {
-                FsError::Db(e) => e as &dyn std::fmt::Display,
-                FsError::MalformedObject => &"corrupt object",
-            }
-        )
-    }
-}
-
-impl std::error::Error for FsError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            FsError::Db(ref e) => Some(e),
-            &FsError::MalformedObject => None,
-        }
-    }
-}
-
-impl From<sled::Error> for FsError {
-    fn from(e: sled::Error) -> Self {
-        FsError::Db(e)
-    }
-}
-
-#[derive(Debug)]
-struct Object {
-    size: u64,
-    ctime: i64,
-    e_tag: BlockID,
-    // The amount of parts uploaded for this object. In case of a simple put_object, this will be
-    // 0. In case of a multipart upload, this wil equal the amount of individual parts. This is
-    // required so we can properly construct the formatted hash later.
-    parts: usize,
-    blocks: Vec<BlockID>,
-}
-
-impl Object {
-    fn format_e_tag(&self) -> String {
-        if self.parts == 0 {
-            format!("\"{}\"", hex_string(&self.e_tag))
-        } else {
-            format!("\"{}-{}\"", hex_string(&self.e_tag), self.parts)
-        }
-    }
-}
-
-impl From<&Object> for Vec<u8> {
-    fn from(o: &Object) -> Self {
-        let mut data =
-            Vec::with_capacity(16 + BLOCKID_SIZE + PTR_SIZE * 2 + o.blocks.len() * BLOCKID_SIZE);
-
-        data.extend_from_slice(&o.size.to_le_bytes());
-        data.extend_from_slice(&o.ctime.to_le_bytes());
-        data.extend_from_slice(&o.e_tag);
-        data.extend_from_slice(&o.parts.to_le_bytes());
-        data.extend_from_slice(&o.blocks.len().to_le_bytes());
-        for block in &o.blocks {
-            data.extend_from_slice(block);
-        }
-
-        data
-    }
-}
-
-impl TryFrom<&[u8]> for Object {
-    type Error = FsError;
-
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() < 16 + BLOCKID_SIZE + 2 * PTR_SIZE {
-            return Err(FsError::MalformedObject);
-        }
-
-        let block_len = usize::from_le_bytes(
-            value[16 + BLOCKID_SIZE + PTR_SIZE..16 + BLOCKID_SIZE + 2 * PTR_SIZE]
-                .try_into()
-                .unwrap(),
-        );
-
-        if value.len() != 16 + 2 * PTR_SIZE + BLOCKID_SIZE + block_len * BLOCKID_SIZE {
-            return Err(FsError::MalformedObject);
-        }
-
-        let mut blocks = Vec::with_capacity(block_len);
-
-        for chunk in value[16 + 2 * PTR_SIZE + BLOCKID_SIZE..].chunks_exact(BLOCKID_SIZE) {
-            blocks.push(chunk.try_into().unwrap());
-        }
-
-        Ok(Object {
-            size: u64::from_le_bytes(value[0..8].try_into().unwrap()),
-            ctime: i64::from_le_bytes(value[8..16].try_into().unwrap()),
-            e_tag: value[16..16 + BLOCKID_SIZE].try_into().unwrap(),
-            parts: usize::from_le_bytes(
-                value[16 + BLOCKID_SIZE..16 + BLOCKID_SIZE + PTR_SIZE]
-                    .try_into()
-                    .unwrap(),
-            ),
-            blocks,
-        })
-    }
-}
-
-// TODO: this can be optimized by making path a `[u8;BLOCKID_SIZE]` and keeping track of a len u8
-#[derive(Debug)]
-struct Block {
-    size: usize,
-    path: Vec<u8>,
-    #[cfg(feature = "refcount")]
-    rc: usize,
-}
-
-impl From<&Block> for Vec<u8> {
-    fn from(b: &Block) -> Self {
-        // NOTE: we encode the lenght of the vector as a single byte, since it can only be 16 bytes
-        // long.
-        #[cfg(not(feature = "refcount"))]
-        let mut out = Vec::with_capacity(PTR_SIZE + b.path.len() + 1);
-        #[cfg(feature = "refcount")]
-        let mut out = Vec::with_capacity(2 * PTR_SIZE + b.path.len() + 1);
-
-        out.extend_from_slice(&b.size.to_le_bytes());
-        out.extend_from_slice(&(b.path.len() as u8).to_le_bytes());
-        out.extend_from_slice(&b.path);
-        #[cfg(feature = "refcount")]
-        out.extend_from_slice(&b.rc.to_le_bytes());
-        out
-    }
-}
-
-impl TryFrom<&[u8]> for Block {
-    type Error = FsError;
-
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() < PTR_SIZE + 1 {
-            return Err(FsError::MalformedObject);
-        }
-        let size = usize::from_le_bytes(value[..PTR_SIZE].try_into().unwrap());
-
-        let vec_size =
-            u8::from_le_bytes(value[PTR_SIZE..PTR_SIZE + 1].try_into().unwrap()) as usize;
-        if value.len() < PTR_SIZE + 1 + vec_size {
-            return Err(FsError::MalformedObject);
-        }
-        let path = value[PTR_SIZE + 1..PTR_SIZE + 1 + vec_size].to_vec();
-
-        #[cfg(not(feature = "refcount"))]
-        if value.len() != PTR_SIZE + 1 + vec_size {
-            return Err(FsError::MalformedObject);
-        }
-
-        #[cfg(feature = "refcount")]
-        if value.len() != PTR_SIZE * 2 + 1 + vec_size {
-            return Err(FsError::MalformedObject);
-        }
-
-        Ok(Block {
-            size,
-            path,
-            #[cfg(feature = "refcount")]
-            rc: usize::from_le_bytes(value[PTR_SIZE + 1 + vec_size..].try_into().unwrap()),
-        })
-    }
-}
-
-impl Block {
-    fn disk_path(&self, mut root: PathBuf) -> PathBuf {
-        // path has at least len 1
-        let dirs = &self.path[..self.path.len() - 1];
-        for byte in dirs {
-            root.push(hex_string(&[*byte]));
-        }
-        root.push(format!(
-            "_{}",
-            hex_string(&[self.path[self.path.len() - 1]])
-        ));
-        root
-    }
-}
-
-#[derive(Debug)]
-struct MultiPart {
-    size: usize,
-    part_number: i64,
-    bucket: String,
-    key: String,
-    upload_id: String,
-    hash: BlockID,
-    blocks: Vec<BlockID>,
-}
-
-impl From<&MultiPart> for Vec<u8> {
-    fn from(mp: &MultiPart) -> Self {
-        let mut out = Vec::with_capacity(
-            5 * PTR_SIZE
-                + 8
-                + mp.bucket.len()
-                + mp.key.len()
-                + mp.upload_id.len()
-                + (1 + mp.blocks.len()) * BLOCKID_SIZE,
-        );
-
-        out.extend_from_slice(&mp.size.to_le_bytes());
-        out.extend_from_slice(&mp.part_number.to_le_bytes());
-        out.extend_from_slice(&mp.bucket.len().to_le_bytes());
-        out.extend_from_slice(&mp.bucket.as_bytes());
-        out.extend_from_slice(&mp.key.len().to_le_bytes());
-        out.extend_from_slice(&mp.key.as_bytes());
-        out.extend_from_slice(&mp.upload_id.len().to_le_bytes());
-        out.extend_from_slice(&mp.upload_id.as_bytes());
-        out.extend_from_slice(&mp.hash);
-        out.extend_from_slice(&mp.blocks.len().to_le_bytes());
-        for block in &mp.blocks {
-            out.extend_from_slice(block);
-        }
-
-        out
-    }
-}
-
-impl TryFrom<&[u8]> for MultiPart {
-    type Error = FsError;
-
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() < 5 * PTR_SIZE + 8 + BLOCKID_SIZE {
-            return Err(FsError::MalformedObject);
-        }
-
-        let bucket_len =
-            usize::from_le_bytes(value[8 + PTR_SIZE..8 + 2 * PTR_SIZE].try_into().unwrap());
-        if value.len() < 8 + 3 * PTR_SIZE + bucket_len {
-            return Err(FsError::MalformedObject);
-        }
-        // SAFETY: Safe as we only insert valid strings
-        let bucket = unsafe {
-            String::from_utf8_unchecked(
-                value[8 + 2 * PTR_SIZE..8 + 2 * PTR_SIZE + bucket_len].to_vec(),
-            )
-        };
-
-        let key_len = usize::from_le_bytes(
-            value[8 + 2 * PTR_SIZE + bucket_len..8 + 3 * PTR_SIZE + bucket_len]
-                .try_into()
-                .unwrap(),
-        );
-        if value.len() < 8 + 4 * PTR_SIZE + bucket_len + key_len {
-            return Err(FsError::MalformedObject);
-        }
-        // SAFETY: Safe as we only insert valid strings
-        let key = unsafe {
-            String::from_utf8_unchecked(
-                value[8 + 3 * PTR_SIZE + bucket_len..8 + 3 * PTR_SIZE + bucket_len + key_len]
-                    .to_vec(),
-            )
-        };
-
-        let upload_id_len = usize::from_le_bytes(
-            value[8 + 3 * PTR_SIZE + bucket_len + key_len..8 + 4 * PTR_SIZE + bucket_len + key_len]
-                .try_into()
-                .unwrap(),
-        );
-        if value.len() < 8 + 5 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE {
-            return Err(FsError::MalformedObject);
-        }
-        // SAFETY: Safe as we only insert valid strings
-        let upload_id = unsafe {
-            String::from_utf8_unchecked(
-                value[8 + 4 * PTR_SIZE + bucket_len + key_len
-                    ..8 + 4 * PTR_SIZE + bucket_len + key_len + upload_id_len]
-                    .to_vec(),
-            )
-        };
-
-        let block_len = usize::from_le_bytes(
-            value[8 + 4 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE
-                ..8 + 5 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE]
-                .try_into()
-                .unwrap(),
-        );
-        if value.len()
-            < 8 + 5 * PTR_SIZE
-                + bucket_len
-                + key_len
-                + upload_id_len
-                + (1 + block_len) * BLOCKID_SIZE
-        {
-            return Err(FsError::MalformedObject);
-        }
-        let mut blocks = Vec::with_capacity(block_len);
-        for chunk in value[8 + 5 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE..]
-            .chunks_exact(BLOCKID_SIZE)
-        {
-            blocks.push(chunk.try_into().unwrap());
-        }
-
-        Ok(MultiPart {
-            size: usize::from_le_bytes(value[..PTR_SIZE].try_into().unwrap()),
-            part_number: i64::from_le_bytes(value[PTR_SIZE..8 + PTR_SIZE].try_into().unwrap()),
-            bucket,
-            key,
-            upload_id,
-            hash: value[8 + 4 * PTR_SIZE + bucket_len + key_len + upload_id_len
-                ..8 + 4 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE]
-                .try_into()
-                .unwrap(),
-            blocks,
-        })
-    }
-}
-
 #[derive(Debug)]
 struct BucketMeta {
     ctime: i64,
@@ -723,205 +402,6 @@ impl TryFrom<&[u8]> for BucketMeta {
             // SAFETY: this is safe because we only store valid strings in the first place.
             name: unsafe { String::from_utf8_unchecked(value[8 + PTR_SIZE..].to_vec()) },
         })
-    }
-}
-
-/// Implementation of a single stream over potentially multiple on disk data block files.
-struct BlockStream {
-    paths: Vec<(PathBuf, usize)>,
-    fp: usize, // pointer to current file path
-    size: usize,
-    processed: usize,
-    has_seeked: bool,
-    range: RangeRequest,
-    file: Option<async_fs::File>, // current file to read
-    open_fut: Option<Pin<Box<dyn Future<Output = io::Result<async_fs::File>> + Send>>>,
-}
-
-impl BlockStream {
-    fn new(paths: Vec<(PathBuf, usize)>, size: usize, range: RangeRequest) -> Self {
-        Self {
-            paths,
-            fp: 0,
-            file: None,
-            size,
-            has_seeked: true,
-            processed: 0,
-            open_fut: None,
-            range,
-        }
-    }
-}
-
-impl Stream for BlockStream {
-    type Item = io::Result<Bytes>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let (start, end) = match self.range {
-            RangeRequest::Range(start, end) => (start, end),
-            RangeRequest::ToBytes(end) => (0, end),
-            RangeRequest::FromBytes(start) => (
-                start,
-                self.paths[if self.file.is_some() || self.open_fut.is_some() {
-                    self.fp - 1
-                } else {
-                    self.fp
-                }]
-                .1 as u64,
-            ),
-            RangeRequest::All => (
-                0,
-                self.paths[if self.file.is_some() || self.open_fut.is_some() {
-                    self.fp - 1
-                } else {
-                    self.fp
-                }]
-                .1 as u64,
-            ),
-        };
-        let processed = self.processed as u64;
-
-        if processed > end {
-            // we did all we need here, exit. This is here because we can't both return data in the
-            // actual read, and indicate the stream is done
-            return Poll::Ready(None);
-        }
-
-        // try to seek in the file to the correct offset
-        // since we skip files we don't need to read from, this file always has at least _some_
-        // bytes to read, and hence seek is always within bounds (even though it is technically not
-        // an error if it isn't).
-        if !self.has_seeked && start > processed {
-            if let Some(ref mut file) = self.file {
-                return match Pin::new(file)
-                    .poll_seek(cx, io::SeekFrom::Current((start - processed) as i64))
-                {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
-                    Poll::Ready(Ok(_)) => {
-                        self.has_seeked = true;
-                        // TODO: this can be `n`
-                        self.processed += (start - processed) as usize;
-                        self.poll_next(cx)
-                    }
-                };
-            }
-        }
-
-        // if we have an open file, try to read it
-        if let Some(ref mut file) = self.file {
-            let mut cap = end - processed + 1;
-            if cap > 4096 {
-                cap = 4096;
-            }
-            let mut buf = vec![0; cap as usize];
-            return match Pin::new(file).poll_read(cx, &mut buf) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
-                Poll::Ready(Ok(0)) => {
-                    self.file = None;
-                    self.poll_next(cx)
-                }
-                Poll::Ready(Ok(n)) => {
-                    self.processed += n;
-                    buf.truncate(n);
-                    Poll::Ready(Some(Ok(buf.into())))
-                }
-            };
-        }
-
-        // check if we even need bytes from the next files
-        // make sure to only do this when we are not already polling. The issue is that opening a
-        // file advanced fp even before the file is opened, which might cause an issue in the
-        // calculation of a range request, if the new file is so small that it would be skipped.
-        if self.open_fut.is_none() {
-            loop {
-                // TODO: Fix this crap
-                let processed = self.processed as u64;
-                match self.range {
-                    RangeRequest::Range(start, end) => {
-                        if processed > end {
-                            return Poll::Ready(None);
-                        } else if processed < start {
-                            if processed + (self.paths[self.fp].1 as u64) < start {
-                                // skip file entirely
-                                self.processed += self.paths[self.fp].1;
-                                self.fp += 1;
-                                if self.fp > self.paths.len() {
-                                    return Poll::Ready(None);
-                                }
-                                continue;
-                            }
-                            break;
-                        } else {
-                            break;
-                        }
-                    }
-                    RangeRequest::ToBytes(end) => {
-                        if processed > end {
-                            return Poll::Ready(None);
-                        }
-                        break;
-                    }
-                    RangeRequest::FromBytes(start) => {
-                        if processed < start {
-                            if processed + (self.paths[self.fp].1 as u64) < start {
-                                // skip file entirely
-                                self.processed += self.paths[self.fp].1;
-                                self.fp += 1;
-                                if self.fp > self.paths.len() {
-                                    return Poll::Ready(None);
-                                }
-                                continue;
-                            }
-                        }
-                        break;
-                    }
-                    RangeRequest::All => break,
-                }
-            }
-        }
-
-        // we don't have an open file, check if we have any more left
-        if self.fp > self.paths.len() {
-            return Poll::Ready(None);
-        }
-
-        // try to open the next file
-        // if we are not opening one already start doing so
-        if self.open_fut.is_none() {
-            self.open_fut = Some(Box::pin(async_fs::File::open(
-                self.paths[self.fp].0.clone(),
-            )));
-            // increment the file pointer for the next file
-            self.fp += 1;
-        };
-
-        // this will always happen
-        if let Some(ref mut open_fut) = self.open_fut {
-            let file_res = ready!(open_fut.as_mut().poll(cx));
-            // we opened a file, or there is an error
-            // clear the open fut as it is done
-            self.open_fut = None;
-            match file_res {
-                // if there is an error, we just return that. The next poll call will try to open the
-                // next file
-                Err(e) => return Poll::Ready(Some(Err(e))),
-                // if we do have an open file, set it as open file, and immediately poll again to try
-                // and read from it
-                Ok(file) => {
-                    self.file = Some(file);
-                    self.has_seeked = false;
-                    return self.poll_next(cx);
-                }
-            };
-        };
-
-        unreachable!();
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.size, Some(self.size))
     }
 }
 
@@ -1003,112 +483,6 @@ impl Stream for BufferedByteStream {
     }
 }
 
-/// Requested bytes from a file.
-#[derive(Debug)]
-enum RangeRequest {
-    /// All bytes, i.e. full file.
-    All,
-    /// A range of bytes from the file. The range is inclusive.
-    Range(u64, u64),
-    /// All bytes until the given position. This is equivalent to Range(0, value).
-    ToBytes(u64),
-    /// All bytes from a given position until the end of the file. This is equivalent to
-    /// Range(value, EOF).
-    FromBytes(u64),
-}
-
-impl RangeRequest {
-    fn size(&self, file_size: u64) -> u64 {
-        let (start, end) = match self {
-            RangeRequest::All => (0, file_size - 1),
-            RangeRequest::ToBytes(end) => (0, *end),
-            RangeRequest::FromBytes(start) => (*start, file_size - 1),
-            RangeRequest::Range(start, end) => (*start, *end),
-        };
-        return end - start + 1;
-    }
-}
-
-// TODO: replace with a parse impl on RangeRequest
-/// Parse a range request.
-fn parse_range_request(input: &Option<String>) -> RangeRequest {
-    if let Some(ref input) = input {
-        if !input.starts_with("bytes=") {
-            eprintln!("Invalid range input \"{}\"", input);
-            return RangeRequest::All;
-        }
-        let (_, input) = input.split_at(6); // split of "bytes="
-        let mut parts = input.split('-');
-        let first = parts.next();
-        let second = parts.next();
-        if first.is_none() || second.is_none() {
-            eprintln!("invalid range request structure {}", input);
-            return RangeRequest::All;
-        }
-        let first = first.unwrap();
-        let second = second.unwrap();
-        if parts.next().is_some() {
-            eprintln!("invalid range request structure {}", input);
-            return RangeRequest::All;
-        }
-        if first == "" && second == "" {
-            eprintln!("invalid range request - missing start AND end {}", input);
-            return RangeRequest::All;
-        }
-        if first == "" {
-            match second.parse() {
-                Ok(end) => RangeRequest::ToBytes(end),
-                Err(e) => {
-                    eprintln!(
-                        "invalid range request - could not parse end ({}): {}",
-                        e, input
-                    );
-                    RangeRequest::All
-                }
-            }
-        } else if second == "" {
-            match first.parse() {
-                Ok(start) => RangeRequest::FromBytes(start),
-                Err(e) => {
-                    eprintln!(
-                        "invalid range request - could not parse start ({}): {}",
-                        e, input
-                    );
-                    RangeRequest::All
-                }
-            }
-        } else {
-            let start = match first.parse() {
-                Ok(start) => start,
-                Err(e) => {
-                    eprintln!(
-                        "invalid range request - could not parse start from string ({}): {}",
-                        e, input
-                    );
-                    return RangeRequest::All;
-                }
-            };
-            let end = match second.parse() {
-                Ok(end) => end,
-                Err(e) => {
-                    eprintln!(
-                        "invalid range request - could not parse end from string ({}): {}",
-                        e, input
-                    );
-                    return RangeRequest::All;
-                }
-            };
-            if end < start {
-                eprintln!("invalid range request - start bigger than end",);
-                return RangeRequest::All;
-            }
-            RangeRequest::Range(start, end)
-        }
-    } else {
-        RangeRequest::All
-    }
-}
-
 #[async_trait]
 impl S3Storage for CasFS {
     async fn complete_multipart_upload(
@@ -1159,7 +533,7 @@ impl S3Storage for CasFS {
             // unwrap here is safe as it is a coding error
             let mp = MultiPart::try_from(&*part_data_enc).expect("Corrupted multipart data");
 
-            blocks.extend_from_slice(&mp.blocks);
+            blocks.extend_from_slice(mp.blocks());
         }
 
         // Compute the e_tag of the multpart upload. Per the S3 standard (according to minio), the
@@ -1170,21 +544,14 @@ impl S3Storage for CasFS {
         for block in &blocks {
             let bi = trace_try!(block_map.get(&block)).unwrap(); // unwrap is fine as all blocks in must be present
             let block_info = Block::try_from(&*bi).expect("Block data is corrupt");
-            size += block_info.size;
+            size += block_info.size();
             hasher.update(&block);
         }
         let e_tag = hasher.finalize().into();
 
         let bc = trace_try!(self.bucket(&bucket));
 
-        let now = Utc::now().timestamp();
-        let object = Object {
-            size: size as u64,
-            ctime: now,
-            parts: cnt as usize,
-            blocks,
-            e_tag,
-        };
+        let object = Object::new(size as u64, e_tag, cnt as usize, blocks);
 
         trace_try!(bc.insert(&key, Vec::<u8>::from(&object)));
 
@@ -1236,8 +603,7 @@ impl S3Storage for CasFS {
             None => return Err(code_error!(NoSuchKey, "Source key does not exist").into()),
         };
 
-        let now = Utc::now().timestamp();
-        obj_meta.ctime = now;
+        obj_meta.touch();
 
         // TODO: check duplicate?
         let dst_bk = trace_try!(self.bucket(&bucket));
@@ -1246,7 +612,7 @@ impl S3Storage for CasFS {
         Ok(CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
                 e_tag: Some(obj_meta.format_e_tag()),
-                last_modified: Some(Utc.timestamp(now, 0).to_rfc3339()),
+                last_modified: Some(Utc.timestamp(obj_meta.ctime(), 0).to_rfc3339()),
             }),
             ..CopyObjectOutput::default()
         })
@@ -1399,21 +765,21 @@ impl S3Storage for CasFS {
             Some(obj) => obj,
         };
         let obj_meta = trace_try!(Object::try_from(&obj.to_vec()[..]));
-        let stream_size = range.size(obj_meta.size);
+        let stream_size = range.size(obj_meta.size());
 
         let e_tag = obj_meta.format_e_tag();
         let block_map = trace_try!(self.block_tree());
-        let mut paths = Vec::with_capacity(obj_meta.blocks.len());
+        let mut paths = Vec::with_capacity(obj_meta.blocks().len());
         let mut block_size = 0;
-        for block in obj_meta.blocks {
+        for block in obj_meta.blocks() {
             // unwrap here is safe as we only add blocks to the list of an object if they are
             // corectly inserted in the block map
             let block_meta_enc = trace_try!(block_map.get(block)).unwrap();
             let block_meta = trace_try!(Block::try_from(&*block_meta_enc));
-            block_size += block_meta.size;
-            paths.push((block_meta.disk_path(self.root.clone()), block_meta.size));
+            block_size += block_meta.size();
+            paths.push((block_meta.disk_path(self.root.clone()), block_meta.size()));
         }
-        debug_assert!(obj_meta.size as usize == block_size);
+        debug_assert!(obj_meta.size() as usize == block_size);
         let block_stream = BlockStream::new(paths, block_size, range);
 
         // TODO: part count
@@ -1421,7 +787,7 @@ impl S3Storage for CasFS {
         Ok(GetObjectOutput {
             body: Some(stream),
             content_length: Some(stream_size as i64),
-            last_modified: Some(Utc.timestamp(obj_meta.ctime, 0).to_rfc3339()),
+            last_modified: Some(Utc.timestamp(obj_meta.ctime(), 0).to_rfc3339()),
             e_tag: Some(e_tag),
             ..GetObjectOutput::default()
         })
@@ -1453,8 +819,8 @@ impl S3Storage for CasFS {
         let obj_meta = trace_try!(Object::try_from(&obj.to_vec()[..]));
 
         Ok(HeadObjectOutput {
-            content_length: Some(obj_meta.size as i64),
-            last_modified: Some(Utc.timestamp(obj_meta.ctime, 0).to_rfc3339()),
+            content_length: Some(obj_meta.size() as i64),
+            last_modified: Some(Utc.timestamp(obj_meta.ctime(), 0).to_rfc3339()),
             e_tag: Some(obj_meta.format_e_tag()),
             ..HeadObjectOutput::default()
         })
@@ -1517,9 +883,9 @@ impl S3Storage for CasFS {
                 S3Object {
                     key: Some(key),
                     e_tag: Some(obj.format_e_tag()),
-                    last_modified: Some(Utc.timestamp(obj.ctime, 0).to_rfc3339()),
+                    last_modified: Some(Utc.timestamp(obj.ctime(), 0).to_rfc3339()),
                     owner: None,
-                    size: Some(obj.size as i64),
+                    size: Some(obj.size() as i64),
                     storage_class: None,
                 }
             })
@@ -1613,9 +979,9 @@ impl S3Storage for CasFS {
                 S3Object {
                     key: Some(key),
                     e_tag: Some(obj.format_e_tag()),
-                    last_modified: Some(Utc.timestamp(obj.ctime, 0).to_rfc3339()),
+                    last_modified: Some(Utc.timestamp(obj.ctime(), 0).to_rfc3339()),
                     owner: None,
-                    size: Some(obj.size as i64),
+                    size: Some(obj.size() as i64),
                     storage_class: None,
                 }
             })
@@ -1672,14 +1038,8 @@ impl S3Storage for CasFS {
         }
 
         let (blocks, hash, size) = trace_try!(self.store_bytes(body).await);
-        let now = Utc::now().timestamp();
-        let obj_meta = Object {
-            size,
-            ctime: now,
-            e_tag: hash,
-            parts: 0,
-            blocks,
-        };
+
+        let obj_meta = Object::new(size, hash, 0, blocks);
 
         trace_try!(trace_try!(self.bucket(&bucket)).insert(&key, Vec::<u8>::from(&obj_meta)));
 
@@ -1729,15 +1089,15 @@ impl S3Storage for CasFS {
 
         let e_tag = format!("\"{}\"", hex_string(&hash));
         let storage_key = format!("{}-{}-{}-{}", &bucket, &key, &upload_id, part_number);
-        let mp = MultiPart {
+        let mp = MultiPart::new(
+            size as usize,
+            part_number,
             bucket,
             key,
             upload_id,
-            part_number,
-            blocks,
             hash,
-            size: size as usize,
-        };
+            blocks,
+        );
 
         let enc_mp = Vec::from(&mp);
 
