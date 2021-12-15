@@ -42,6 +42,7 @@ structopt = { version = "0.3", optional = true }
 anyhow = { version = "1.0", optional = true }
 dotenv = { version = "0.15", optional = true }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
+prometheus = { version = "0.13", features = ["process"] }
 
 [profile.release]
 lto = true
