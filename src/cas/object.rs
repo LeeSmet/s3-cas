@@ -1,6 +1,8 @@
-use super::block::{BlockID, BLOCKID_SIZE};
-use super::errors::FsError;
-use super::fs::PTR_SIZE;
+use super::{
+    block::{BlockID, BLOCKID_SIZE},
+    errors::FsError,
+    fs::PTR_SIZE,
+};
 use chrono::Utc;
 use faster_hex::hex_string;
 use std::convert::{TryFrom, TryInto};
