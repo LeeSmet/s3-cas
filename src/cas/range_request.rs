@@ -20,7 +20,7 @@ impl RangeRequest {
             RangeRequest::FromBytes(start) => (*start, file_size - 1),
             RangeRequest::Range(start, end) => (*start, *end),
         };
-        return end - start + 1;
+        end - start + 1
     }
 }
 
@@ -46,11 +46,11 @@ pub fn parse_range_request(input: &Option<String>) -> RangeRequest {
             eprintln!("invalid range request structure {}", input);
             return RangeRequest::All;
         }
-        if first == "" && second == "" {
+        if first.is_empty() && second.is_empty() {
             eprintln!("invalid range request - missing start AND end {}", input);
             return RangeRequest::All;
         }
-        if first == "" {
+        if first.is_empty() {
             match second.parse() {
                 Ok(end) => RangeRequest::ToBytes(end),
                 Err(e) => {
@@ -61,7 +61,7 @@ pub fn parse_range_request(input: &Option<String>) -> RangeRequest {
                     RangeRequest::All
                 }
             }
-        } else if second == "" {
+        } else if second.is_empty() {
             match first.parse() {
                 Ok(start) => RangeRequest::FromBytes(start),
                 Err(e) => {

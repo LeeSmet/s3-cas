@@ -56,11 +56,11 @@ impl From<&MultiPart> for Vec<u8> {
         out.extend_from_slice(&mp.size.to_le_bytes());
         out.extend_from_slice(&mp.part_number.to_le_bytes());
         out.extend_from_slice(&mp.bucket.len().to_le_bytes());
-        out.extend_from_slice(&mp.bucket.as_bytes());
+        out.extend_from_slice(mp.bucket.as_bytes());
         out.extend_from_slice(&mp.key.len().to_le_bytes());
-        out.extend_from_slice(&mp.key.as_bytes());
+        out.extend_from_slice(mp.key.as_bytes());
         out.extend_from_slice(&mp.upload_id.len().to_le_bytes());
-        out.extend_from_slice(&mp.upload_id.as_bytes());
+        out.extend_from_slice(mp.upload_id.as_bytes());
         out.extend_from_slice(&mp.hash);
         out.extend_from_slice(&mp.blocks.len().to_le_bytes());
         for block in &mp.blocks {

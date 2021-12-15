@@ -193,8 +193,9 @@ impl CasFS {
                     // Only print error, we might be able to remove the other ones. If we exist
                     // here, those will be left dangling.
                     eprintln!(
-                        "Could not unlink path {} from path map",
-                        hex_string(block.path())
+                        "Could not unlink path {} from path map: {}",
+                        hex_string(block.path()),
+                        e
                     );
                 };
             }
@@ -234,10 +235,10 @@ impl CasFS {
         let data = BufferedByteStream::new(data);
         let mut size = 0;
         data.map(|res| match res {
-            Ok(buffers) => buffers.into_iter().map(|buffer| Ok(buffer)).collect(),
+            Ok(buffers) => buffers.into_iter().map(Ok).collect(),
             Err(e) => vec![Err(e)],
         })
-        .map(|i| stream::iter(i))
+        .map(stream::iter)
         .flatten()
         .inspect(|maybe_bytes| {
             if let Ok(bytes) = maybe_bytes {
@@ -284,7 +285,7 @@ impl CasFS {
                                     blocks.insert(&block_hash, Vec::from(&block))?;
                                 }
 
-                                return Ok(false);
+                                Ok(false)
                             }
                             None => {
                                 // find a free path
@@ -438,7 +439,7 @@ impl Stream for BufferedByteStream {
             match ready!(Pin::new(&mut self.bs).poll_next(cx)) {
                 None => {
                     self.finished = true;
-                    if self.buffer.len() > 0 {
+                    if self.buffer.is_empty() {
                         // since we won't be using the vec anymore, we can replace it with a 0 capacity
                         // vec. This wont' allocate.
                         return Poll::Ready(Some(Ok(vec![mem::replace(
@@ -592,7 +593,7 @@ impl S3Storage for CasFS {
             AmzCopySource::Bucket { bucket, key } => (bucket, key),
         };
 
-        if !trace_try!(self.bucket_exists(&bucket)) {
+        if !trace_try!(self.bucket_exists(bucket)) {
             return Err(code_error!(NoSuchBucket, "Target bucket does not exist").into());
         }
 
@@ -606,7 +607,7 @@ impl S3Storage for CasFS {
         obj_meta.touch();
 
         // TODO: check duplicate?
-        let dst_bk = trace_try!(self.bucket(&bucket));
+        let dst_bk = trace_try!(self.bucket(bucket));
         trace_try!(dst_bk.insert(key, Vec::<u8>::from(&obj_meta)));
 
         Ok(CopyObjectOutput {
@@ -723,7 +724,7 @@ impl S3Storage for CasFS {
 
         Ok(DeleteObjectsOutput {
             deleted: Some(deleted),
-            errors: if errors.len() == 0 {
+            errors: if errors.is_empty() {
                 None
             } else {
                 Some(errors)
@@ -853,13 +854,7 @@ impl S3Storage for CasFS {
         } = input;
 
         let key_count = max_keys
-            .and_then(|mk| {
-                if mk > MAX_KEYS {
-                    Some(MAX_KEYS)
-                } else {
-                    Some(mk)
-                }
-            })
+            .map(|mk| if mk > MAX_KEYS { MAX_KEYS } else { mk })
             .unwrap_or(MAX_KEYS);
 
         let b = trace_try!(self.bucket(&bucket));
@@ -930,18 +925,12 @@ impl S3Storage for CasFS {
         let b = trace_try!(self.bucket(&bucket));
 
         let key_count = max_keys
-            .and_then(|mk| {
-                if mk > MAX_KEYS {
-                    Some(MAX_KEYS)
-                } else {
-                    Some(mk)
-                }
-            })
+            .map(|mk| if mk > MAX_KEYS { MAX_KEYS } else { mk })
             .unwrap_or(MAX_KEYS);
 
         let token = if let Some(ref rt) = continuation_token {
             let mut out = vec![0; rt.len() / 2];
-            if let Err(_) = hex_decode(rt.as_bytes(), &mut out) {
+            if hex_decode(rt.as_bytes(), &mut out).is_err() {
                 return Err(
                     code_error!(InvalidToken, "continuation token has an invalid format").into(),
                 );
@@ -957,7 +946,7 @@ impl S3Storage for CasFS {
         };
 
         let mut objects: Vec<_> = b
-            .scan_prefix(&prefix.as_ref().map(|v| v.as_str()).or(Some("")).unwrap())
+            .scan_prefix(prefix.as_deref().or(Some("")).unwrap())
             .filter_map(|read_result| match read_result {
                 Ok((r, k)) => Some((r, k)),
                 Err(_) => None,

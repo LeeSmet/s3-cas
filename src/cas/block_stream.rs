@@ -146,16 +146,14 @@ impl Stream for BlockStream {
                         break;
                     }
                     RangeRequest::FromBytes(start) => {
-                        if processed < start {
-                            if processed + (self.paths[self.fp].1 as u64) < start {
-                                // skip file entirely
-                                self.processed += self.paths[self.fp].1;
-                                self.fp += 1;
-                                if self.fp > self.paths.len() {
-                                    return Poll::Ready(None);
-                                }
-                                continue;
+                        if processed < start && processed + (self.paths[self.fp].1 as u64) < start {
+                            // skip file entirely
+                            self.processed += self.paths[self.fp].1;
+                            self.fp += 1;
+                            if self.fp > self.paths.len() {
+                                return Poll::Ready(None);
                             }
+                            continue;
                         }
                         break;
                     }
