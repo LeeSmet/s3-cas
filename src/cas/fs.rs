@@ -439,7 +439,7 @@ impl Stream for BufferedByteStream {
             match ready!(Pin::new(&mut self.bs).poll_next(cx)) {
                 None => {
                     self.finished = true;
-                    if self.buffer.is_empty() {
+                    if !self.buffer.is_empty() {
                         // since we won't be using the vec anymore, we can replace it with a 0 capacity
                         // vec. This wont' allocate.
                         return Poll::Ready(Some(Ok(vec![mem::replace(
