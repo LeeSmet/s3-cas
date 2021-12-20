@@ -1,6 +1,7 @@
 use super::{
     block::{Block, BlockID, BLOCKID_SIZE},
     block_stream::BlockStream,
+    bucket_meta::BucketMeta,
     errors::FsError,
     multipart::MultiPart,
     object::Object,
@@ -217,10 +218,7 @@ impl CasFS {
                 };
                 // unwrap here is fine as it means the db is corrupt
                 let bucket_meta = BucketMeta::try_from(&*value).expect("Corrupted bucket metadata");
-                Some(Bucket {
-                    name: Some(bucket_meta.name),
-                    creation_date: Some(Utc.timestamp(bucket_meta.ctime, 0).to_rfc3339()),
-                })
+                Some(bucket_meta.into())
             })
             .collect())
     }
@@ -369,40 +367,6 @@ impl CasFS {
             content_hash.finalize().into(),
             size,
         ))
-    }
-}
-
-#[derive(Debug)]
-struct BucketMeta {
-    ctime: i64,
-    name: String,
-}
-
-impl From<&BucketMeta> for Vec<u8> {
-    fn from(b: &BucketMeta) -> Self {
-        let mut out = Vec::with_capacity(8 + PTR_SIZE + b.name.len());
-        out.extend_from_slice(&b.ctime.to_le_bytes());
-        out.extend_from_slice(&b.name.len().to_le_bytes());
-        out.extend_from_slice(b.name.as_bytes());
-        out
-    }
-}
-
-impl TryFrom<&[u8]> for BucketMeta {
-    type Error = FsError;
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() < 8 + PTR_SIZE {
-            return Err(FsError::MalformedObject);
-        }
-        let name_len = usize::from_le_bytes(value[8..8 + PTR_SIZE].try_into().unwrap());
-        if value.len() != 8 + PTR_SIZE + name_len {
-            return Err(FsError::MalformedObject);
-        }
-        Ok(BucketMeta {
-            ctime: i64::from_le_bytes(value[..8].try_into().unwrap()),
-            // SAFETY: this is safe because we only store valid strings in the first place.
-            name: unsafe { String::from_utf8_unchecked(value[8 + PTR_SIZE..].to_vec()) },
-        })
     }
 }
 
@@ -651,10 +615,7 @@ impl S3Storage for CasFS {
         }
         let bucket_meta = trace_try!(self.bucket_meta_tree());
 
-        let bm = Vec::from(&BucketMeta {
-            name: bucket.clone(),
-            ctime: Utc::now().timestamp(),
-        });
+        let bm = Vec::from(&BucketMeta::new(Utc::now().timestamp(), bucket.clone()));
 
         trace_try!(bucket_meta.insert(&bucket, bm));
 
