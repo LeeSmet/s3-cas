@@ -42,24 +42,8 @@ impl Stream for BlockStream {
         let (start, end) = match self.range {
             RangeRequest::Range(start, end) => (start, end),
             RangeRequest::ToBytes(end) => (0, end),
-            RangeRequest::FromBytes(start) => (
-                start,
-                self.paths[if self.file.is_some() || self.open_fut.is_some() {
-                    self.fp - 1
-                } else {
-                    self.fp
-                }]
-                .1 as u64,
-            ),
-            RangeRequest::All => (
-                0,
-                self.paths[if self.file.is_some() || self.open_fut.is_some() {
-                    self.fp - 1
-                } else {
-                    self.fp
-                }]
-                .1 as u64,
-            ),
+            RangeRequest::FromBytes(start) => (start, self.size as u64 + start),
+            RangeRequest::All => (0, self.size as u64),
         };
         let processed = self.processed as u64;
 
