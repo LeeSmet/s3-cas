@@ -241,9 +241,10 @@ impl CasFS {
             }
         })
         .zip(stream::repeat((tx, block_map, path_map)))
+        .enumerate()
         .for_each_concurrent(
             5,
-            |(maybe_chunk, (mut tx, block_map, path_map))| async move {
+            |(idx, (maybe_chunk, (mut tx, block_map, path_map)))| async move {
                 if let Err(e) = maybe_chunk {
                     if let Err(e) = tx
                         .send(Err(std::io::Error::new(e.kind(), e.to_string())))
@@ -313,7 +314,7 @@ impl CasFS {
                         return;
                     }
                     Ok(false) => {
-                        if let Err(e) = tx.send(Ok(block_hash)).await {
+                        if let Err(e) = tx.send(Ok((idx, block_hash))).await {
                             eprintln!("Could not send block id: {}", e);
                         }
                         return;
@@ -351,15 +352,19 @@ impl CasFS {
                     }
                 }
 
-                if let Err(e) = tx.send(Ok(block_hash)).await {
+                if let Err(e) = tx.send(Ok((idx, block_hash))).await {
                     eprintln!("Could not send block id: {}", e);
                 }
             },
         )
         .await;
 
+        let mut ids = rx.try_collect::<Vec<(usize, BlockID)>>().await?;
+        // Make sure the chunks are in the proper order
+        ids.sort_by_key(|a| a.0);
+
         Ok((
-            rx.try_collect::<Vec<BlockID>>().await?,
+            ids.into_iter().map(|(_, id)| id).collect(),
             content_hash.finalize().into(),
             size,
         ))
