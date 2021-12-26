@@ -930,7 +930,7 @@ impl S3Storage for CasFS {
             body,
             bucket,
             content_length,
-            content_md5,
+            content_md5: _, // TODO: Verify
             key,
             part_number,
             upload_id,
