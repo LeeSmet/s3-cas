@@ -3,7 +3,7 @@ use prometheus::{register_int_counter_vec, IntCounterVec};
 use s3_server::S3Storage;
 use std::sync::Arc;
 
-const S3_API_METHODS: &[&'static str] = &[
+const S3_API_METHODS: &[&str] = &[
     "complete_multipart_upload",
     "copy_object",
     "create_multipart_upload",
