@@ -39,6 +39,12 @@ impl SharedMetrics {
     }
 }
 
+impl Default for SharedMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct Metrics {
     method_calls: IntCounterVec,
 }
