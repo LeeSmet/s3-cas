@@ -23,11 +23,11 @@ impl BucketMeta {
     }
 }
 
-impl Into<Bucket> for BucketMeta {
-    fn into(self) -> Bucket {
+impl From<BucketMeta> for Bucket {
+    fn from(bm: BucketMeta) -> Self {
         Bucket {
-            creation_date: Some(Utc.timestamp(self.ctime, 0).to_rfc3339()),
-            name: Some(self.name),
+            creation_date: Some(Utc.timestamp(bm.ctime, 0).to_rfc3339()),
+            name: Some(bm.name),
         }
     }
 }
