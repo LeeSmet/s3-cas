@@ -42,6 +42,7 @@ use sled::{Db, Transactional};
 use std::{
     convert::{TryFrom, TryInto},
     io, mem,
+    ops::Deref,
     path::PathBuf,
 };
 use uuid::Uuid;
@@ -751,16 +752,22 @@ impl S3Storage for CasFS {
 
         let b = trace_try!(self.bucket(&bucket));
 
+        let start_bytes = if let Some(ref marker) = marker {
+            marker.as_bytes()
+        } else if let Some(ref prefix) = prefix {
+            prefix.as_bytes()
+        } else {
+            &[]
+        };
+        let prefix_bytes = prefix.as_deref().or(Some("")).unwrap().as_bytes();
+
         let mut objects = b
-            .scan_prefix(&prefix.as_deref().or(Some("")).unwrap())
+            .range(start_bytes..)
             .filter_map(|read_result| match read_result {
-                Ok((r, k)) => Some((r, k)),
                 Err(_) => None,
+                Ok((k, v)) => Some((k, v)),
             })
-            .skip_while(|(raw_key, _)| match marker {
-                None => false,
-                Some(ref marker) => raw_key <= &sled::IVec::from(marker.as_bytes()),
-            })
+            .take_while(|(raw_key, _)| raw_key.starts_with(prefix_bytes))
             .map(|(raw_key, raw_value)| {
                 // SAFETY: we only insert valid utf8 strings
                 let key = unsafe { String::from_utf8_unchecked(raw_key.to_vec()) };
@@ -837,20 +844,28 @@ impl S3Storage for CasFS {
             None
         };
 
+        let start_bytes = if let Some(ref token) = token {
+            token.as_bytes()
+        } else if let Some(ref prefix) = prefix {
+            prefix.as_bytes()
+        } else if let Some(ref start_after) = start_after {
+            start_after.as_bytes()
+        } else {
+            &[]
+        };
+        let prefix_bytes = prefix.as_deref().or(Some("")).unwrap().as_bytes();
+
         let mut objects: Vec<_> = b
-            .scan_prefix(prefix.as_deref().or(Some("")).unwrap())
+            .range(start_bytes..)
             .filter_map(|read_result| match read_result {
                 Ok((r, k)) => Some((r, k)),
                 Err(_) => None,
             })
-            .skip_while(|(key, _)| match start_after {
+            .skip_while(|(raw_key, _)| match start_after {
                 None => false,
-                Some(ref start_after) => key <= &sled::IVec::from(start_after.as_bytes()),
+                Some(ref start_after) => raw_key.deref() <= start_after.as_bytes(),
             })
-            .skip_while(|(key, _)| match token {
-                None => false,
-                Some(ref t) => key < &sled::IVec::from(t.as_bytes()),
-            })
+            .take_while(|(raw_key, _)| raw_key.starts_with(prefix_bytes))
             .map(|(raw_key, raw_value)| {
                 // SAFETY: we only insert valid utf8 strings
                 let key = unsafe { String::from_utf8_unchecked(raw_key.to_vec()) };
