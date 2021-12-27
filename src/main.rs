@@ -1,5 +1,4 @@
-use hyper::body::HttpBody;
-use s3_cas::{cas::CasFS, passthrough::Passthrough};
+use s3_cas::cas::CasFS;
 use s3_server::S3Service;
 use s3_server::SimpleAuth;
 
@@ -8,11 +7,11 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use futures::{future, join};
+use futures::{future, try_join};
 use hyper::server::Server;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response};
-use prometheus::{Counter, Encoder, Opts, Registry, TextEncoder};
+use prometheus::{Encoder, TextEncoder};
 use structopt::StructOpt;
 // use tracing::{debug, info};
 
@@ -115,14 +114,15 @@ async fn main() -> Result<()> {
         Server::from_tcp(listener)?.serve(make_service)
     };
 
-    //info!("server is running at http://{}:{}/", args.host, args.port);
     println!("server is running at http://{}:{}/", args.host, args.port);
     println!(
         "metric server is running at http://{}:{}",
         args.metric_host, args.metric_port
     );
-    //server.await?;
-    join!(metric_server, server);
+
+    if let Err(e) = try_join!(metric_server, server) {
+        eprintln!("Server failed: {}", e);
+    }
 
     Ok(())
 }

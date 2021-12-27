@@ -367,7 +367,6 @@ impl CasFS {
 
                 if let Err(e) = tx.send(Ok((idx, block_hash))).await {
                     eprintln!("Could not send block id: {}", e);
-                    return;
                 }
             },
         )
