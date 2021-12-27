@@ -1,7 +1,7 @@
 use async_trait::async_trait;
-use prometheus::{register_int_counter_vec, IntCounterVec};
+use prometheus::{register_int_counter_vec, register_int_gauge, IntCounterVec, IntGauge};
 use s3_server::S3Storage;
-use std::sync::Arc;
+use std::{ops::Deref, sync::Arc};
 
 const S3_API_METHODS: &[&str] = &[
     "complete_multipart_upload",
@@ -33,10 +33,6 @@ impl SharedMetrics {
             metrics: Arc::new(Metrics::new()),
         }
     }
-
-    pub fn add_method_call(&self, call_name: &str) {
-        self.metrics.add_method_call(call_name);
-    }
 }
 
 impl Default for SharedMetrics {
@@ -45,13 +41,22 @@ impl Default for SharedMetrics {
     }
 }
 
-struct Metrics {
+impl Deref for SharedMetrics {
+    type Target = Metrics;
+
+    fn deref(&self) -> &Self::Target {
+        &self.metrics
+    }
+}
+
+pub struct Metrics {
     method_calls: IntCounterVec,
+    bucket_count: IntGauge,
 }
 
 // TODO: this can be improved, make sure this does not crash on multiple instances;
 impl Metrics {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let method_calls = register_int_counter_vec!(
             "s3_api_method_invocations",
             "Amount of times a particular S3 API method has been called in the lifetime of the process",
@@ -63,11 +68,32 @@ impl Metrics {
             method_calls.with_label_values(&[api]);
         }
 
-        Self { method_calls }
+        let bucket_count = register_int_gauge!(
+            "s3_bucket_count",
+            "Amount of active buckets in the S3 instance"
+        )
+        .expect("can register an int gauge");
+
+        Self {
+            method_calls,
+            bucket_count,
+        }
     }
 
-    fn add_method_call(&self, call_name: &str) {
+    pub fn add_method_call(&self, call_name: &str) {
         self.method_calls.with_label_values(&[call_name]).inc();
+    }
+
+    pub fn set_bucket_count(&self, count: usize) {
+        self.bucket_count.set(count as i64)
+    }
+
+    pub fn inc_bucket_count(&self) {
+        self.bucket_count.inc()
+    }
+
+    pub fn dec_bucket_count(&self) {
+        self.bucket_count.dec()
     }
 }
 

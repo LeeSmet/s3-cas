@@ -67,8 +67,8 @@ async fn main() -> Result<()> {
 
     // setup the storage
     // let fs = FileSystem::new(&args.fs_root)?;
-    let fs = CasFS::new(args.fs_root, args.meta_root);
     let metrics = s3_cas::metrics::SharedMetrics::new();
+    let fs = CasFS::new(args.fs_root, args.meta_root, metrics.clone());
     let fs = s3_cas::metrics::MetricFs::new(fs, metrics);
     // debug!(?fs);
 

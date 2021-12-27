@@ -1,3 +1,5 @@
+use crate::metrics::SharedMetrics;
+
 use super::{
     block::{Block, BlockID, BLOCKID_SIZE},
     block_stream::BlockStream,
@@ -55,16 +57,17 @@ const MAX_KEYS: i64 = 1000;
 pub struct CasFS {
     db: Db,
     root: PathBuf,
+    metrics: SharedMetrics,
 }
 
 impl CasFS {
-    pub fn new(mut root: PathBuf, mut meta_path: PathBuf) -> Self {
+    pub fn new(mut root: PathBuf, mut meta_path: PathBuf, metrics: SharedMetrics) -> Self {
         meta_path.push("db");
         root.push("blocks");
-        Self {
-            db: sled::open(meta_path).unwrap(),
-            root,
-        }
+        let db = sled::open(meta_path).unwrap();
+        // Get the current amount of buckets
+        metrics.set_bucket_count(db.open_tree(BUCKET_META_TREE).unwrap().len());
+        Self { db, root, metrics }
     }
 
     /// Open the tree containing the block map.
@@ -542,6 +545,8 @@ impl S3Storage for CasFS {
 
         trace_try!(bucket_meta.insert(&bucket, bm));
 
+        self.metrics.inc_bucket_count();
+
         Ok(CreateBucketOutput {
             ..CreateBucketOutput::default()
         })
@@ -569,6 +574,8 @@ impl S3Storage for CasFS {
         }
 
         trace_try!(self.delete_object(&bucket, &key).await);
+
+        self.metrics.dec_bucket_count();
 
         Ok(DeleteObjectOutput::default())
     }
@@ -608,6 +615,7 @@ impl S3Storage for CasFS {
 
         Ok(DeleteObjectsOutput {
             deleted: Some(deleted),
+            // TODO: should this just always be set?
             errors: if errors.is_empty() {
                 None
             } else {
