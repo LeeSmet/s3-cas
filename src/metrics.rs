@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use prometheus::{register_int_counter_vec, register_int_gauge, IntCounterVec, IntGauge};
+use prometheus::{
+    register_int_counter, register_int_counter_vec, register_int_gauge, IntCounter, IntCounterVec,
+    IntGauge,
+};
 use s3_server::S3Storage;
 use std::{ops::Deref, sync::Arc};
 
@@ -52,6 +55,13 @@ impl Deref for SharedMetrics {
 pub struct Metrics {
     method_calls: IntCounterVec,
     bucket_count: IntGauge,
+    data_bytes_received: IntCounter,
+    data_bytes_sent: IntCounter,
+    data_bytes_written: IntCounter,
+    data_blocks_written: IntCounter,
+    data_blocks_ignored: IntCounter,
+    data_blocks_pending_write: IntGauge,
+    data_blocks_write_errors: IntCounter,
 }
 
 // TODO: this can be improved, make sure this does not crash on multiple instances;
@@ -72,11 +82,58 @@ impl Metrics {
             "s3_bucket_count",
             "Amount of active buckets in the S3 instance"
         )
-        .expect("can register an int gauge");
+        .expect("can register an int gauge in the default registry");
+
+        let data_bytes_received = register_int_counter!(
+            "s3_data_bytes_received",
+            "Amount of bytes of actual data received"
+        )
+        .expect("can register an int counter in the default registry");
+
+        let data_bytes_sent =
+            register_int_counter!("s3_data_bytes_sent", "Amount of bytes of actual data sent")
+                .expect("can register an int counter in the default registry");
+
+        let data_bytes_written = register_int_counter!(
+            "s3_data_bytes_written",
+            "Amount of bytes of actual data written to block storage"
+        )
+        .expect("can register an int counter in the default registry");
+
+        let data_blocks_written = register_int_counter!(
+            "s3_data_blocks_written",
+            "Amount of data blocks written to block storage"
+        )
+        .expect("can register an int counter in the default registry");
+
+        let data_blocks_ignored = register_int_counter!(
+            "s3_data_blocks_ignored",
+            "Amount of data blocks not written to block storage, because a block with the same hash is already present"
+        )
+        .expect("can register an int counter in the default registry");
+
+        let data_blocks_pending_write = register_int_gauge!(
+            "s3_data_blocks_pending_write",
+            "Amount of data blocks in memory, waiting to be written to block storage"
+        )
+        .expect("can register an int gauge in the default registry");
+
+        let data_blocks_write_errors = register_int_counter!(
+            "s3_data_blocks_write_errors",
+            "Amount of data blocks which could not be written to block storage"
+        )
+        .expect("can register an int counter in the default registry");
 
         Self {
             method_calls,
             bucket_count,
+            data_bytes_received,
+            data_bytes_sent,
+            data_bytes_written,
+            data_blocks_written,
+            data_blocks_ignored,
+            data_blocks_pending_write,
+            data_blocks_write_errors,
         }
     }
 
@@ -94,6 +151,43 @@ impl Metrics {
 
     pub fn dec_bucket_count(&self) {
         self.bucket_count.dec()
+    }
+
+    pub fn bytes_received(&self, amount: usize) {
+        self.data_bytes_received.inc_by(amount as u64)
+    }
+
+    pub fn bytes_sent(&self, amount: usize) {
+        self.data_bytes_sent.inc_by(amount as u64)
+    }
+
+    pub fn bytes_written(&self, amount: usize) {
+        self.data_bytes_written.inc_by(amount as u64)
+    }
+
+    pub fn block_pending(&self) {
+        self.data_blocks_pending_write.inc()
+    }
+
+    pub fn block_written(&self, block_size: usize) {
+        self.data_bytes_written.inc_by(block_size as u64);
+        self.data_blocks_pending_write.dec();
+        self.data_blocks_written.inc()
+    }
+
+    pub fn block_write_error(&self) {
+        self.data_blocks_pending_write.dec();
+        self.data_blocks_write_errors.inc()
+    }
+
+    pub fn block_ignored(&self) {
+        self.data_blocks_ignored.inc()
+    }
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

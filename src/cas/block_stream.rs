@@ -1,3 +1,5 @@
+use crate::metrics::SharedMetrics;
+
 use super::range_request::RangeRequest;
 use futures::{ready, AsyncRead, AsyncSeek, Future, Stream};
 use hyper::body::Bytes;
@@ -13,6 +15,7 @@ pub struct BlockStream {
     paths: Vec<(PathBuf, usize)>,
     fp: usize, // pointer to current file path
     size: usize,
+    metrics: SharedMetrics,
     processed: usize,
     has_seeked: bool,
     range: RangeRequest,
@@ -21,12 +24,18 @@ pub struct BlockStream {
 }
 
 impl BlockStream {
-    pub fn new(paths: Vec<(PathBuf, usize)>, size: usize, range: RangeRequest) -> Self {
+    pub fn new(
+        paths: Vec<(PathBuf, usize)>,
+        size: usize,
+        range: RangeRequest,
+        metrics: SharedMetrics,
+    ) -> Self {
         Self {
             paths,
             fp: 0,
             file: None,
             size,
+            metrics,
             has_seeked: true,
             processed: 0,
             open_fut: None,
@@ -91,6 +100,7 @@ impl Stream for BlockStream {
                 Poll::Ready(Ok(n)) => {
                     self.processed += n;
                     buf.truncate(n);
+                    self.metrics.bytes_sent(n);
                     Poll::Ready(Some(Ok(buf.into())))
                 }
             };

@@ -242,6 +242,7 @@ impl CasFS {
             if let Ok(bytes) = maybe_bytes {
                 content_hash.update(bytes);
                 size += bytes.len() as u64;
+                self.metrics.bytes_received(bytes.len());
             }
         })
         .zip(stream::repeat((tx, block_map, path_map)))
@@ -318,12 +319,13 @@ impl CasFS {
                         return;
                     }
                     Ok(false) => {
+                        self.metrics.block_ignored();
                         if let Err(e) = tx.send(Ok((idx, block_hash))).await {
                             eprintln!("Could not send block id: {}", e);
                         }
                         return;
                     }
-                    Ok(true) => {}
+                    Ok(true) => self.metrics.block_pending(),
                     // We don't abort manually so this can't happen
                     Err(sled::transaction::TransactionError::Abort(_)) => unreachable!(),
                 };
@@ -338,6 +340,7 @@ impl CasFS {
                     Ok(None) => unreachable!(),
                     Err(e) => {
                         if let Err(e) = tx.send(Err(e.into())).await {
+                            self.metrics.block_write_error();
                             eprintln!("Could not send db error: {}", e);
                         }
                         return;
@@ -347,17 +350,24 @@ impl CasFS {
                 let block_path = block.disk_path(self.root.clone());
                 if let Err(e) = async_fs::create_dir_all(block_path.parent().unwrap()).await {
                     if let Err(e) = tx.send(Err(e)).await {
+                        self.metrics.block_write_error();
                         eprintln!("Could not send path create error: {}", e);
+                        return;
                     }
                 }
-                if let Err(e) = async_fs::write(block_path, bytes).await {
+                if let Err(e) = async_fs::write(block_path, &bytes).await {
                     if let Err(e) = tx.send(Err(e)).await {
+                        self.metrics.block_write_error();
                         eprintln!("Could not send block write error: {}", e);
+                        return;
                     }
                 }
 
+                self.metrics.block_written(bytes.len());
+
                 if let Err(e) = tx.send(Ok((idx, block_hash))).await {
                     eprintln!("Could not send block id: {}", e);
+                    return;
                 }
             },
         )
@@ -561,6 +571,8 @@ impl S3Storage for CasFS {
 
         trace_try!(self.bucket_delete(&bucket).await);
 
+        self.metrics.dec_bucket_count();
+
         Ok(DeleteBucketOutput)
     }
 
@@ -575,8 +587,6 @@ impl S3Storage for CasFS {
         }
 
         trace_try!(self.delete_object(&bucket, &key).await);
-
-        self.metrics.dec_bucket_count();
 
         Ok(DeleteObjectOutput::default())
     }
@@ -674,7 +684,7 @@ impl S3Storage for CasFS {
             paths.push((block_meta.disk_path(self.root.clone()), block_meta.size()));
         }
         debug_assert!(obj_meta.size() as usize == block_size);
-        let block_stream = BlockStream::new(paths, block_size, range);
+        let block_stream = BlockStream::new(paths, block_size, range, self.metrics.clone());
 
         // TODO: part count
         let stream = ByteStream::new_with_size(block_stream, stream_size as usize);
