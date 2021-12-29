@@ -3,7 +3,7 @@ use super::{
     errors::FsError,
     fs::PTR_SIZE,
 };
-use chrono::Utc;
+use chrono::{SecondsFormat, TimeZone, Utc};
 use faster_hex::hex_string;
 use std::convert::{TryFrom, TryInto};
 
@@ -46,16 +46,17 @@ impl Object {
         self.size
     }
 
-    pub fn ctime(&self) -> i64 {
-        self.ctime
-    }
-
     pub fn parts(&self) -> usize {
         self.parts
     }
 
     pub fn blocks(&self) -> &[BlockID] {
         &self.blocks
+    }
+
+    pub fn format_ctime(&self) -> String {
+        Utc.timestamp(self.ctime, 0)
+            .to_rfc3339_opts(SecondsFormat::Secs, true)
     }
 }
 

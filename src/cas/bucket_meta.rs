@@ -1,5 +1,5 @@
 use super::{errors::FsError, fs::PTR_SIZE};
-use chrono::{TimeZone, Utc};
+use chrono::{SecondsFormat, TimeZone, Utc};
 use s3_server::dto::Bucket;
 use std::convert::{TryFrom, TryInto};
 
@@ -26,7 +26,10 @@ impl BucketMeta {
 impl From<BucketMeta> for Bucket {
     fn from(bm: BucketMeta) -> Self {
         Bucket {
-            creation_date: Some(Utc.timestamp(bm.ctime, 0).to_rfc3339()),
+            creation_date: Some(
+                Utc.timestamp(bm.ctime, 0)
+                    .to_rfc3339_opts(SecondsFormat::Secs, true),
+            ),
             name: Some(bm.name),
         }
     }

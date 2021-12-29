@@ -513,7 +513,7 @@ impl S3Storage for CasFS {
         Ok(CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
                 e_tag: Some(obj_meta.format_e_tag()),
-                last_modified: Some(Utc.timestamp(obj_meta.ctime(), 0).to_rfc3339()),
+                last_modified: Some(obj_meta.format_ctime()),
             }),
             ..CopyObjectOutput::default()
         })
@@ -690,7 +690,7 @@ impl S3Storage for CasFS {
         Ok(GetObjectOutput {
             body: Some(stream),
             content_length: Some(stream_size as i64),
-            last_modified: Some(Utc.timestamp(obj_meta.ctime(), 0).to_rfc3339()),
+            last_modified: Some(obj_meta.format_ctime()),
             e_tag: Some(e_tag),
             ..GetObjectOutput::default()
         })
@@ -723,7 +723,7 @@ impl S3Storage for CasFS {
 
         Ok(HeadObjectOutput {
             content_length: Some(obj_meta.size() as i64),
-            last_modified: Some(Utc.timestamp(obj_meta.ctime(), 0).to_rfc3339()),
+            last_modified: Some(obj_meta.format_ctime()),
             e_tag: Some(obj_meta.format_e_tag()),
             ..HeadObjectOutput::default()
         })
@@ -786,7 +786,7 @@ impl S3Storage for CasFS {
                 S3Object {
                     key: Some(key),
                     e_tag: Some(obj.format_e_tag()),
-                    last_modified: Some(Utc.timestamp(obj.ctime(), 0).to_rfc3339()),
+                    last_modified: Some(obj.format_ctime()),
                     owner: None,
                     size: Some(obj.size() as i64),
                     storage_class: None,
@@ -884,7 +884,7 @@ impl S3Storage for CasFS {
                 S3Object {
                     key: Some(key),
                     e_tag: Some(obj.format_e_tag()),
-                    last_modified: Some(Utc.timestamp(obj.ctime(), 0).to_rfc3339()),
+                    last_modified: Some(obj.format_ctime()),
                     owner: None,
                     size: Some(obj.size() as i64),
                     storage_class: None,
