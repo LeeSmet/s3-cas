@@ -61,6 +61,45 @@ pub struct CasFS {
     metrics: SharedMetrics,
 }
 
+struct PendingMarker {
+    metrics: SharedMetrics,
+    in_flight: u64,
+}
+
+impl PendingMarker {
+    pub fn new(metrics: SharedMetrics) -> Self {
+        Self {
+            metrics,
+            in_flight: 0,
+        }
+    }
+
+    pub fn block_pending(&mut self) {
+        self.metrics.block_pending();
+        self.in_flight += 1;
+    }
+
+    pub fn block_write_error(&mut self) {
+        self.metrics.block_write_error();
+        self.in_flight -= 1;
+    }
+
+    pub fn block_ignored(&mut self) {
+        self.metrics.block_ignored();
+    }
+
+    pub fn block_written(&mut self, size: usize) {
+        self.metrics.block_written(size);
+        self.in_flight -= 1;
+    }
+}
+
+impl Drop for PendingMarker {
+    fn drop(&mut self) {
+        self.metrics.blocks_dropped(self.in_flight)
+    }
+}
+
 impl CasFS {
     pub fn new(mut root: PathBuf, mut meta_path: PathBuf, metrics: SharedMetrics) -> Self {
         meta_path.push("db");
@@ -311,6 +350,7 @@ impl CasFS {
                         }
                     });
 
+                let mut pm = PendingMarker::new(self.metrics.clone());
                 match should_write {
                     Err(sled::transaction::TransactionError::Storage(e)) => {
                         if let Err(e) = tx.send(Err(e.into())).await {
@@ -319,13 +359,13 @@ impl CasFS {
                         return;
                     }
                     Ok(false) => {
-                        self.metrics.block_ignored();
+                        pm.block_ignored();
                         if let Err(e) = tx.send(Ok((idx, block_hash))).await {
                             eprintln!("Could not send block id: {}", e);
                         }
                         return;
                     }
-                    Ok(true) => self.metrics.block_pending(),
+                    Ok(true) => pm.block_pending(),
                     // We don't abort manually so this can't happen
                     Err(sled::transaction::TransactionError::Abort(_)) => unreachable!(),
                 };
@@ -340,7 +380,7 @@ impl CasFS {
                     Ok(None) => unreachable!(),
                     Err(e) => {
                         if let Err(e) = tx.send(Err(e.into())).await {
-                            self.metrics.block_write_error();
+                            pm.block_write_error();
                             eprintln!("Could not send db error: {}", e);
                         }
                         return;
@@ -350,20 +390,20 @@ impl CasFS {
                 let block_path = block.disk_path(self.root.clone());
                 if let Err(e) = async_fs::create_dir_all(block_path.parent().unwrap()).await {
                     if let Err(e) = tx.send(Err(e)).await {
-                        self.metrics.block_write_error();
+                        pm.block_write_error();
                         eprintln!("Could not send path create error: {}", e);
                         return;
                     }
                 }
                 if let Err(e) = async_fs::write(block_path, &bytes).await {
                     if let Err(e) = tx.send(Err(e)).await {
-                        self.metrics.block_write_error();
+                        pm.block_write_error();
                         eprintln!("Could not send block write error: {}", e);
                         return;
                     }
                 }
 
-                self.metrics.block_written(bytes.len());
+                pm.block_written(bytes.len());
 
                 if let Err(e) = tx.send(Ok((idx, block_hash))).await {
                     eprintln!("Could not send block id: {}", e);

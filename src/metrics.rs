@@ -62,6 +62,7 @@ pub struct Metrics {
     data_blocks_ignored: IntCounter,
     data_blocks_pending_write: IntGauge,
     data_blocks_write_errors: IntCounter,
+    data_blocks_dropped: IntCounter,
 }
 
 // TODO: this can be improved, make sure this does not crash on multiple instances;
@@ -124,6 +125,11 @@ impl Metrics {
         )
         .expect("can register an int counter in the default registry");
 
+        let data_blocks_dropped = register_int_counter!(
+            "s3_data_blocks_dropped",
+            "Amount of data blocks dropped due to client disconnects before the block was (fully) written to storage",
+        ).expect("can register an int gauge in the default registry");
+
         Self {
             method_calls,
             bucket_count,
@@ -134,6 +140,7 @@ impl Metrics {
             data_blocks_ignored,
             data_blocks_pending_write,
             data_blocks_write_errors,
+            data_blocks_dropped,
         }
     }
 
@@ -182,6 +189,11 @@ impl Metrics {
 
     pub fn block_ignored(&self) {
         self.data_blocks_ignored.inc()
+    }
+
+    pub fn blocks_dropped(&self, amount: u64) {
+        self.data_blocks_pending_write.sub(amount as i64);
+        self.data_blocks_dropped.inc_by(amount)
     }
 }
 
