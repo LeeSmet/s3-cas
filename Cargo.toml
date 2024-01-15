@@ -9,15 +9,8 @@ description = "An experimental S3 server using a cas storage layer"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
 default = []
-binary = [
-	"anyhow",
-	"dotenv",
-	"structopt",
-	"tokio"
-]
-vendored = [
-	"openssl"
-]
+binary = ["anyhow", "dotenv", "structopt", "tokio"]
+vendored = ["openssl"]
 refcount = []
 
 [[bin]]
@@ -38,11 +31,17 @@ async-fs = "1.5"
 faster-hex = "0.6"
 uuid = { version = "0.8", features = ["v4"] }
 chrono = "0.4"
-structopt = { version = "0.3", optional = true } 
+structopt = { version = "0.3", optional = true }
 anyhow = { version = "1.0", optional = true }
 dotenv = { version = "0.15", optional = true }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 prometheus = { version = "0.13", features = ["process"] }
+
+[target.'cfg(any(taget_arch = "x86", target_arch = "x86_64"))'.dependencies]
+md-5 = { version = "0.9", features = ["asm"] }
+
+[target.'cfg(not(any(taget_arch = "x86", target_arch = "x86_64")))'.dependencies]
+md-5 = { version = "0.9" }
 
 [profile.release]
 lto = true
