@@ -25,12 +25,16 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
+            features: vendored,refcount,binary
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            features: vendored,refcount,binary,asm
           - target: x86_64-apple-darwin
             os: macos-latest
+            features: vendored,refcount,binary,asm
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
+            features: vendored,refcount,binary
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -44,4 +48,4 @@ jobs:
           archive: $bin-$target
           # (required) GitHub token for uploading assets to GitHub Releases.
           token: ${{ secrets.GITHUB_TOKEN }}
-          features: "vendored,binary,refcount"
+          features: ${{ matrix.features }}
