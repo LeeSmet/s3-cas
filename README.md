@@ -24,3 +24,4 @@ cargo build --release --features binary,refcount
 - Only the basic API is implemented, and even then it is not entirely implemented (for instance copy
   between servers is not implemented).
 - The codebase is very much POC and not following a good abstraction structure
+- Single key only, no support to add multiple keys with different permissions.
